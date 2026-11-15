@@ -16,12 +16,13 @@ import {
   saveIfUnchanged,
   sessionBeforeReset,
   sessionVerifiedAt,
+  STATE_FIELDS,
   MFA_CODE,
   MFA_REMEMBER,
   MFA_TRUSTED,
   withSession,
 } from './core.js'
-import type { Resolved, MfaOptions, MfaUser } from './types.js'
+import type { Resolved, MfaOptions, MfaState, MfaUser } from './types.js'
 
 /** Same answer as a wrong password to anyone reading the API; the site's own form reads `mfa`. */
 export class MfaError extends AuthenticationError {
@@ -178,10 +179,19 @@ async function hasUnmovedState(payload: Payload, o: Resolved, userId: string | n
   return (await users.collection.countDocuments({ _id: id, [o.legacyUserField!]: { $exists: true, $ne: null } })) > 0
 }
 
+const isEmpty = (v: unknown) => v === null || v === undefined || v === '' || (Array.isArray(v) && v.length === 0) || (typeof v === 'object' && !Array.isArray(v) && Object.keys(v as object).length === 0)
+
 /**
  * Moves state a site kept on the account (`legacyUserField`, e.g. `twoStep`) into the plugin's collection.
- * Run it once, as a script, after a backup (with the site owner's yes). For each account with old
- * state: copy it if the account has no new state yet (an existing one counts as moved), then remove the old field.
+ * Run it once, as a script, after a backup (with the site owner's yes). For each account with old state:
+ * - no new state yet: copy it, then remove the old field;
+ * - a new record without a secret (a reset that blocked emailed codes, or a setup never confirmed) and an old secret:
+ *   merge the old state into that record, filling only the fields the record leaves empty, so the old secret, its
+ *   enabled date and recovery codes arrive and the record's own fields (such as an email-code block) stay. The old
+ *   field is removed only after that write succeeds. Counted in `merged`;
+ * - a new record that already has the same secret: counted as moved;
+ * - a new record with a different secret: the record's secret stays, the old one is dropped with the old field, and the
+ *   account is named in `differentSecret` so the site can look at it (the old secret stays in the backup).
  * A setup that was never confirmed (a pending app, no secret) is dropped, and counted in the log. Safe to run again.
  */
 export async function moveLegacyState(payload: Payload, args: { field?: string } = {}) {
@@ -191,22 +201,33 @@ export async function moveLegacyState(payload: Payload, args: { field?: string }
   const users = rawUsers(payload, { ...o, legacyUserField: field })
   const old = await users.collection.find({ [field]: { $exists: true, $ne: null } }, { projection: { _id: 1, [field]: 1 } }).toArray()
   let moved = 0
+  let merged = 0
   let alreadyMoved = 0
   let unfinished = 0
+  const differentSecret: string[] = []
   for (const row of old) {
     const id = String(row._id)
     const legacy = (row[field] ?? {}) as Record<string, unknown>
     const existing = await loadState(payload, id)
-    if (existing.docId !== null) alreadyMoved++
-    else if (legacy.secret) {
+    if (existing.docId !== null) {
+      if (legacy.secret && !existing.state.secret) {
+        const next: Record<string, unknown> = { ...existing.state }
+        for (const k of STATE_FIELDS) if (k !== 'version' && k !== 'sessions' && isEmpty(next[k]) && !isEmpty(legacy[k])) next[k] = legacy[k]
+        if (!(await saveIfUnchanged(payload, id, existing, next as MfaState))) throw new Error(`mfa: couldn’t merge the old state of account ${id}; nothing was removed from it.`)
+        merged++
+      } else {
+        alreadyMoved++
+        if (legacy.secret && existing.state.secret !== legacy.secret) differentSecret.push(id)
+      }
+    } else if (legacy.secret) {
       if (!(await saveIfUnchanged(payload, id, existing, { ...(legacy as object), sessions: {}, version: 0 })) && (await loadState(payload, id)).docId === null)
         throw new Error(`mfa: couldn’t move the old state of account ${id}; nothing was removed from it.`)
       moved++
     } else if (legacy.pending) unfinished++
     await users.collection.updateOne({ _id: row._id }, { $unset: { [field]: '' } })
   }
-  payload.logger.info({ msg: `mfa: moved ${moved}, already moved ${alreadyMoved}, dropped ${unfinished} unfinished setup(s); cleared ${old.length} account(s).` })
-  return { moved, alreadyMoved, unfinished, cleared: old.length }
+  payload.logger.info({ msg: `mfa: moved ${moved}, merged ${merged}, already moved ${alreadyMoved} (${differentSecret.length} with a different secret, kept as the record had it), dropped ${unfinished} unfinished setup(s); cleared ${old.length} account(s).` })
+  return { moved, merged, alreadyMoved, unfinished, cleared: old.length, differentSecret }
 }
 
 function loginEndpoint(o: Resolved): Endpoint {

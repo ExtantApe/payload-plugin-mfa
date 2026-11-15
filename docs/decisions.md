@@ -21,3 +21,4 @@ Dated decisions for this repo, newest last.
 
 - 2026-11-10 (self-audit): events carry a request copy with nothing secret: no code or remember value in its context, no headers, no body. It keeps the user, the transaction and the rest of the context, which is what an audit trail needs.
 - 2026-11-13: moved to the ExtantApe GitHub organization and the `@extantape` npm scope at the same version. EXTANT APE owns its reusable tools and licenses them to the platform. The earlier package name is deprecated with a pointer here, and GitHub redirects the old repository address.
+- 2026-11-15: `moveLegacyState` merges the old secret into an existing record that has none, instead of counting the account as moved (Captive Origins K5009, a Security Analyst read of the first site). The record's own fields stay; the old group goes only after the merge is written. A record with its own secret is kept, and a different old secret is reported in `differentSecret`.
