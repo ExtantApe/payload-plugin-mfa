@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `moveLegacyState` no longer loses an old secret when the account already has a state record without one. Such a record appears between deploy and move (a password reset that blocks emailed codes, or a setup never confirmed), and the move used to count it as moved and remove the old group, silently turning two-step off. Now the old secret, enabled date, recovery codes and any other field the record leaves empty are merged into the record, the record's own fields (an email-code block and its date, the reset date) stay, and the old group is removed only after the merge is written. A record that already has a secret keeps it; if the old one differs, the account's id is listed in the new `differentSecret` result and the old group is still removed. The result gains `merged` and `differentSecret`. Found by a Security Analyst read of the first site, 2026-11-15 (Captive Origins K5009).
+
+Tested: 3 new tests (49 in all): a record with a null and one with an empty secret are merged (secret, enabled date, recovery codes, last step, with the email block and reset date kept, old group gone, two-step on, sign-in with a code works, rerun is a no-op); a record with the same secret and one with a different secret are kept and the different one is reported; an account with no record moves as before. Not tested: against a real site database, and a merge write that loses a race (it throws before removing anything, by the same check as the plain move).
+
 ## 0.1.1 (unreleased)
 
 - `onEvent` gets a copy of the request without the entered code, the remember value, the headers (cookies, tokens and the client address) or the body. The raw request used to reach it, so a site logging `event.req` could have stored a code (found by the 2026-11-10 test self-audit). `payload` and the translation helpers stay on the copy but aren't enumerable, so a logger walking it never reaches the app's secret. The actor of an event is `event.user`: during a sign-in, `req.user` is whoever the request already had.

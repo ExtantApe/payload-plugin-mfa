@@ -124,5 +124,5 @@ Found while doing this: **the key must come from the raw app secret** (`payload.
 
 - **Renamed** to `payload-plugin-mfa` by the owner (see `docs/decisions.md`). The text above keeps its original names (two-step, `twoStep()`, `two-step-state`); in the code they're now `mfa()`, `MfaError`, `MFA_*`, `mfa-state` and `mfa-attempts`.
 - **Attempt records expire.** Every try writes a record, refused ones included. Tries older than the window are now deleted as new ones arrive, with a test.
-- **The legacy move is explicit.** It runs as `moveLegacyState(payload)`, a script the site runs once after a backup, not at every cold start where two instances could race. An account whose old state hasn't moved can't sign in, so nothing runs half-moved. An existing new state counts as moved; a setup never confirmed is dropped and counted.
+- **The legacy move is explicit.** It runs as `moveLegacyState(payload)`, a script the site runs once after a backup, not at every cold start where two instances could race. An account whose old state hasn't moved can't sign in, so nothing runs half-moved. An existing new state with a secret counts as moved; one without a secret gets the old state merged in (2026-11-15); a setup never confirmed is dropped and counted.
 - **Clock skew** between servers is documented as a limit of the try order.
