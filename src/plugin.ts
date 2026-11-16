@@ -56,6 +56,7 @@ function stateCollection(o: Resolved): CollectionConfig {
       { name: 'emailBlockedUntil', type: 'date' },
       { name: 'enrollUntil', type: 'date' },
       { name: 'resetAt', type: 'date' },
+      { name: 'turnedOffAt', type: 'date' },
       { name: 'version', type: 'number', index: true },
     ],
   }
@@ -182,16 +183,27 @@ async function hasUnmovedState(payload: Payload, o: Resolved, userId: string | n
 const isEmpty = (v: unknown) => v === null || v === undefined || v === '' || (Array.isArray(v) && v.length === 0) || (typeof v === 'object' && !Array.isArray(v) && Object.keys(v as object).length === 0)
 
 /**
+ * Whether a secret-less record shows a deliberate clear of the factor: `turnedOffAt` (written by `turnOff`), `resetAt` or
+ * `enrollUntil` (written by `resetFor`), or anything a working factor leaves behind (an enabled date, recovery codes,
+ * a last step). Merging the old field into such a record would bring back what was revoked. What stays mergeable:
+ * a started setup (`pending`) and an email-code block (`emailBlockedUntil`, from a password reset or `afterPasswordSet`),
+ * neither of which revokes the old factor.
+ */
+const wasDeliberatelyCleared = (s: MfaState) => Boolean(s.turnedOffAt || s.resetAt || s.enrollUntil || s.enabledAt || s.lastStep || s.verifiedAt || (s.recovery ?? []).length)
+
+/**
  * Moves state a site kept on the account (`legacyUserField`, e.g. `twoStep`) into the plugin's collection.
  * Run it once, as a script, after a backup (with the site owner's yes). For each account with old state:
  * - no new state yet: copy it, then remove the old field;
- * - a new record without a secret (a reset that blocked emailed codes, or a setup never confirmed) and an old secret:
- *   merge the old state into that record, filling only the fields the record leaves empty, so the old secret, its
- *   enabled date and recovery codes arrive and the record's own fields (such as an email-code block) stay. The old
- *   field is removed only after that write succeeds. Counted in `merged`;
+ * - a new record without a secret and an old secret, with no sign of a deliberate clear (see `wasDeliberatelyCleared`):
+ *   merge the old state into that record, filling only the fields the record leaves empty (secret, enabled date, last
+ *   step), so the record's own fields (an email-code block and its date) stay. Recovery codes are never copied into an
+ *   existing record. The old field is removed only after that write succeeds. Counted in `merged`;
+ * - a new record without a secret that shows a deliberate clear (turned off, or reset by a maintainer): nothing is
+ *   merged, the old field is left in place (so the account stays at the two-step step) and the account is named in `needsReview`;
  * - a new record that already has the same secret: counted as moved;
  * - a new record with a different secret: the record's secret stays, the old one is dropped with the old field, and the
- *   account is named in `differentSecret` so the site can look at it (the old secret stays in the backup).
+ *   account is named in `differentSecret` (the old secret stays in the backup).
  * A setup that was never confirmed (a pending app, no secret) is dropped, and counted in the log. Safe to run again.
  */
 export async function moveLegacyState(payload: Payload, args: { field?: string } = {}) {
@@ -204,15 +216,21 @@ export async function moveLegacyState(payload: Payload, args: { field?: string }
   let merged = 0
   let alreadyMoved = 0
   let unfinished = 0
+  let cleared = 0
   const differentSecret: string[] = []
+  const needsReview: string[] = []
   for (const row of old) {
     const id = String(row._id)
     const legacy = (row[field] ?? {}) as Record<string, unknown>
     const existing = await loadState(payload, id)
     if (existing.docId !== null) {
       if (legacy.secret && !existing.state.secret) {
+        if (wasDeliberatelyCleared(existing.state)) {
+          needsReview.push(id)
+          continue
+        }
         const next: Record<string, unknown> = { ...existing.state }
-        for (const k of STATE_FIELDS) if (k !== 'version' && k !== 'sessions' && isEmpty(next[k]) && !isEmpty(legacy[k])) next[k] = legacy[k]
+        for (const k of STATE_FIELDS) if (k !== 'version' && k !== 'sessions' && k !== 'recovery' && isEmpty(next[k]) && !isEmpty(legacy[k])) next[k] = legacy[k]
         if (!(await saveIfUnchanged(payload, id, existing, next as MfaState))) throw new Error(`mfa: couldn’t merge the old state of account ${id}; nothing was removed from it.`)
         merged++
       } else {
@@ -225,9 +243,10 @@ export async function moveLegacyState(payload: Payload, args: { field?: string }
       moved++
     } else if (legacy.pending) unfinished++
     await users.collection.updateOne({ _id: row._id }, { $unset: { [field]: '' } })
+    cleared++
   }
-  payload.logger.info({ msg: `mfa: moved ${moved}, merged ${merged}, already moved ${alreadyMoved} (${differentSecret.length} with a different secret, kept as the record had it), dropped ${unfinished} unfinished setup(s); cleared ${old.length} account(s).` })
-  return { moved, merged, alreadyMoved, unfinished, cleared: old.length, differentSecret }
+  payload.logger.info({ msg: `mfa: moved ${moved}, merged ${merged}, already moved ${alreadyMoved} (${differentSecret.length} with a different secret, kept as the record had it), dropped ${unfinished} unfinished setup(s); cleared ${cleared} account(s); ${needsReview.length} left for review (turned off or reset after the old state was written).` })
+  return { moved, merged, alreadyMoved, unfinished, cleared, differentSecret, needsReview }
 }
 
 function loginEndpoint(o: Resolved): Endpoint {

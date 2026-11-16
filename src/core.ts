@@ -40,7 +40,7 @@ export const keysOf = (payload: Payload): Keys => {
  */
 export type Loaded = { docId: string | number | null; state: MfaState }
 
-export const STATE_FIELDS = ['secret', 'pending', 'enabledAt', 'lastStep', 'recovery', 'verifiedAt', 'sessions', 'emailCode', 'emailCodeExpires', 'emailBlockedUntil', 'enrollUntil', 'resetAt', 'version'] as const
+export const STATE_FIELDS = ['secret', 'pending', 'enabledAt', 'lastStep', 'recovery', 'verifiedAt', 'sessions', 'emailCode', 'emailCodeExpires', 'emailBlockedUntil', 'enrollUntil', 'resetAt', 'turnedOffAt', 'version'] as const
 
 export async function loadState(payload: Payload, userId: string | number, req?: PayloadRequest): Promise<Loaded> {
   const o = optionsOf(payload)

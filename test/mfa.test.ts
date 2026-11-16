@@ -511,8 +511,8 @@ describe('moving state a site kept on the account', () => {
     const second = await new BasePayload().init({ config: await legacyCfg() })
     // Not moved yet: refused even with a good code, so it can't run half-moved.
     expect(await signIn(second, { email: 'legacy@example.invalid', password: PW, code: codeFor(secret) }).then(() => 'signed in', (e) => e.mfa)).toBe('needed')
-    expect(await moveLegacyState(second)).toEqual({ moved: 1, merged: 0, alreadyMoved: 0, unfinished: 1, cleared: 2, differentSecret: [] })
-    expect(await moveLegacyState(second)).toEqual({ moved: 0, merged: 0, alreadyMoved: 0, unfinished: 0, cleared: 0, differentSecret: [] })
+    expect(await moveLegacyState(second)).toEqual({ moved: 1, merged: 0, alreadyMoved: 0, unfinished: 1, cleared: 2, differentSecret: [], needsReview: [] })
+    expect(await moveLegacyState(second)).toEqual({ moved: 0, merged: 0, alreadyMoved: 0, unfinished: 0, cleared: 0, differentSecret: [], needsReview: [] })
     void half
     expect(await (second.db as any).collections.users.collection.countDocuments({ twoStep: { $exists: true } })).toBe(0)
     const moved = (await second.find({ collection: 'mfa-state' as never, where: { user: { equals: String(u.id) } }, overrideAccess: true })).docs
@@ -546,25 +546,57 @@ describe('moving state onto an account that already has a record', () => {
     const a = await mk(p, 'merge-null')
     const b = await mk(p, 'merge-empty')
     for (const [u, empty] of [[a, null], [b, '']] as const) {
-      await put(p, String(u.id), { secret: empty, emailBlockedUntil: block, resetAt: '2026-11-14T00:00:00.000Z' })
+      await put(p, String(u.id), { secret: empty, emailBlockedUntil: block, pending: 'sealed-pending-setup' })
       await raw(p).updateOne({ _id: (await raw(p).findOne({ email: u.email }))._id }, { $set: { twoStep: { secret: seal(key, secret), enabledAt, recovery: ['hash-one', 'hash-two'], lastStep: 7 } } })
     }
-    expect(await moveLegacyState(p)).toEqual({ moved: 0, merged: 2, alreadyMoved: 0, unfinished: 0, cleared: 2, differentSecret: [] })
+    expect(await moveLegacyState(p)).toEqual({ moved: 0, merged: 2, alreadyMoved: 0, unfinished: 0, cleared: 2, differentSecret: [], needsReview: [] })
     expect(await raw(p).countDocuments({ twoStep: { $exists: true } })).toBe(0)
     for (const u of [a, b]) {
       const docs = await stateOf(p, String(u.id))
       expect(docs).toHaveLength(1)
       expect(open(key, docs[0].secret)).toBe(secret)
       expect(docs[0].enabledAt).toBe(enabledAt)
-      expect(docs[0].recovery).toEqual(['hash-one', 'hash-two'])
+      expect(docs[0].recovery ?? []).toEqual([])
       expect(docs[0].lastStep).toBe(7)
       expect(docs[0].emailBlockedUntil).toBe(block)
-      expect(docs[0].resetAt).toBe('2026-11-14T00:00:00.000Z')
+      expect(docs[0].pending).toBe('sealed-pending-setup')
       expect(await isOnFor(p, u.id)).toBe(true)
       expect(await signIn(p, { email: u.email!, password: PW, code: codeFor(secret) }).then(() => 'signed in', (e) => e.mfa)).toBe('signed in')
     }
     // Safe to run again.
-    expect(await moveLegacyState(p)).toEqual({ moved: 0, merged: 0, alreadyMoved: 0, unfinished: 0, cleared: 0, differentSecret: [] })
+    expect(await moveLegacyState(p)).toEqual({ moved: 0, merged: 0, alreadyMoved: 0, unfinished: 0, cleared: 0, differentSecret: [], needsReview: [] })
+    await p.destroy()
+  })
+
+  it('does not merge into a record left by turnOff or a maintainer reset: the old field stays and the account is listed', async () => {
+    const p = await new BasePayload().init({ config: await legacyCfg('cleared') })
+    const key = deriveKey(SECRET, 'example-site', 'two-step-secret')
+    const old = seal(key, 'GEZDGNBVGY3TQOJQ')
+    const off = await mk(p, 'cleared-off')
+    const reset = await mk(p, 'cleared-reset')
+    const plain = await mk(p, 'cleared-plain')
+    const enrolP = async (u: U) => { const { key } = await start(p, { userId: u.id }); await confirm(p, { userId: u.id, code: codeFor(key) }); return key }
+    const k1 = await enrolP(off)
+    await turnOff(p, { userId: off.id, code: nextStepCode(k1) })
+    await enrolP(reset)
+    await resetFor(p, reset.id, { actor: 'maintainer' })
+    await put(p, String(plain.id), { emailBlockedUntil: new Date(Date.now() + 3600_000).toISOString() })
+    for (const u of [off, reset, plain]) await raw(p).updateOne({ _id: (await raw(p).findOne({ email: u.email }))._id }, { $set: { twoStep: { secret: old, enabledAt: '2025-01-01T00:00:00.000Z', recovery: ['old-hash'] } } })
+    const r = await moveLegacyState(p)
+    expect({ ...r, needsReview: undefined }).toEqual({ moved: 0, merged: 1, alreadyMoved: 0, unfinished: 0, cleared: 1, differentSecret: [], needsReview: undefined })
+    expect([...r.needsReview].sort()).toEqual([String(off.id), String(reset.id)].sort())
+    for (const u of [off, reset]) {
+      const docs = await stateOf(p, String(u.id))
+      expect(docs[0].secret ?? null).toBe(null)
+      expect(docs[0].recovery ?? []).toEqual([])
+      expect(await isOnFor(p, u.id)).toBe(false)
+      expect(await raw(p).countDocuments({ email: u.email, twoStep: { $exists: true } })).toBe(1)
+    }
+    expect(await raw(p).countDocuments({ email: plain.email, twoStep: { $exists: true } })).toBe(0)
+    expect(await isOnFor(p, plain.id)).toBe(true)
+    expect((await stateOf(p, String(plain.id)))[0].recovery ?? []).toEqual([])
+    // Run again: still left for review, nothing changes.
+    expect((await moveLegacyState(p)).needsReview).toHaveLength(2)
     await p.destroy()
   })
 
@@ -579,7 +611,7 @@ describe('moving state onto an account that already has a record', () => {
     const set = async (u: U, g: object) => raw(p).updateOne({ _id: (await raw(p).findOne({ email: u.email }))._id }, { $set: { twoStep: g } })
     await set(same, { secret: mine, enabledAt: '2025-01-01T00:00:00.000Z' })
     await set(diff, { secret: seal(key, 'GEZDGNBVGY3TQOJQ'), enabledAt: '2025-01-01T00:00:00.000Z', recovery: ['old'] })
-    expect(await moveLegacyState(p)).toEqual({ moved: 0, merged: 0, alreadyMoved: 2, unfinished: 0, cleared: 2, differentSecret: [String(diff.id)] })
+    expect(await moveLegacyState(p)).toEqual({ moved: 0, merged: 0, alreadyMoved: 2, unfinished: 0, cleared: 2, differentSecret: [String(diff.id)], needsReview: [] })
     for (const u of [same, diff]) {
       const docs = await stateOf(p, String(u.id))
       expect(docs).toHaveLength(1)
@@ -596,7 +628,7 @@ describe('moving state onto an account that already has a record', () => {
     const key = deriveKey(SECRET, 'example-site', 'two-step-secret')
     const u = await mk(p, 'plain')
     await raw(p).updateOne({ _id: (await raw(p).findOne({ email: u.email }))._id }, { $set: { twoStep: { secret: seal(key, 'JBSWY3DPEHPK3PXP'), enabledAt: '2026-01-01T00:00:00.000Z' } } })
-    expect(await moveLegacyState(p)).toEqual({ moved: 1, merged: 0, alreadyMoved: 0, unfinished: 0, cleared: 1, differentSecret: [] })
+    expect(await moveLegacyState(p)).toEqual({ moved: 1, merged: 0, alreadyMoved: 0, unfinished: 0, cleared: 1, differentSecret: [], needsReview: [] })
     expect(await isOnFor(p, u.id)).toBe(true)
     await p.destroy()
   })
