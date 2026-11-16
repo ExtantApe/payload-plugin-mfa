@@ -23,6 +23,8 @@ export type MfaState = {
   enrollUntil?: string | null
   /** When a maintainer last reset two-step: any session made before it is refused, even one a racing sign-in wrote back. */
   resetAt?: string | null
+  /** When the account turned two-step off itself. Marks a secret-less record as a deliberate clear. */
+  turnedOffAt?: string | null
   /** Bumped on every write, so two requests racing with the same code can't both win. */
   version?: number | null
 }
