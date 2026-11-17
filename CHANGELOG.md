@@ -9,7 +9,9 @@
 
 Tested: 4 new tests (50 in all), on in-memory MongoDB with made-up accounts only, not a copy of any site's data: null and empty-secret records with a pending setup and an email block are merged (secret, enabled date, last step; email block and pending kept; no recovery codes; old group gone; two-step on; sign-in works; rerun is a no-op); a record left by `turnOff` and one left by `resetFor` are not merged, keep the old field, no secret and no recovery, and are listed in `needsReview` (also on a rerun); same and different secrets are kept and the different one reported; an account with no record moves as before. Not tested: a real site database, a merge write that loses a race, or a mutation check of the new guard.
 
-## 0.1.1 (unreleased)
+## 0.1.0 (2026-11-13)
+
+Published as 0.1.0 together with the first version below. 0.1.1 was never released on its own.
 
 - `onEvent` gets a copy of the request without the entered code, the remember value, the headers (cookies, tokens and the client address) or the body. The raw request used to reach it, so a site logging `event.req` could have stored a code (found by the 2026-11-10 test self-audit). `payload` and the translation helpers stay on the copy but aren't enumerable, so a logger walking it never reaches the app's secret. The actor of an event is `event.user`: during a sign-in, `req.user` is whoever the request already had.
 
@@ -20,7 +22,7 @@ Tested: 4 new tests (50 in all), on in-memory MongoDB with made-up accounts only
 
 Tested: 5 new tests (29 in all), including a reset racing a write that would keep the old secret, and old sessions written back after a reset (refused at request and at refresh). A security read approved 85b901f and found the session race in da6bfe2; both are fixed here. A mutation check shows each part of the reset fails one of the reset's own tests when removed: the cleared secret and recovery codes, the version guard, the cleared tries, ending sessions, the kept email-code block, and both window bounds. Not yet used on a site.
 
-## 0.1.0 (unreleased)
+### First version
 
 First version, as `payload-plugin-mfa` (renamed from payload-plugin-two-step by the owner, 2026-11-10), extracted from the first site's own two-step sign-in, with the decisions in `docs/adr/0001-design.md` (including the pre-publish read): factors, use-once codes with a race guard, per-account limits with keys built inside, the required rule at sign-in, refresh and every request, per-session expiry, remembered browsers, email codes blocked after a reset, step-up `verify`, and the login endpoint.
 
