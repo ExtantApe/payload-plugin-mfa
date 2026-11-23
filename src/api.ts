@@ -167,7 +167,7 @@ export async function sendEmailCode(payload: Payload, args: { email: string; req
   const o = optionsOf(payload)
   const email = String(args.email ?? '').trim().toLowerCase()
   if (!email) return
-  const found = (await payload.find({ collection: o.users as never, where: { email: { equals: email } }, limit: 1, depth: 0, overrideAccess: true, showHiddenFields: true, ...(args.req ? { req: args.req } : {}) })).docs[0] as unknown as MfaUser | undefined
+  const found = (await payload.find({ pagination: false, collection: o.users as never, where: { email: { equals: email } }, limit: 1, depth: 0, overrideAccess: true, showHiddenFields: true, ...(args.req ? { req: args.req } : {}) })).docs[0] as unknown as MfaUser | undefined
   if (!found) return
   const loaded = await loadState(payload, found.id, args.req)
   const state = loaded.state
