@@ -1,5 +1,11 @@
 # Test audit
 
+## 2026-11-22: the old-secret merge
+
+- Promises: an old secret is merged into a record that has none, keeping the record's own fields; a record left by turnOff or a maintainer reset is a deliberate clear, so the old field is left alone; a record with a different secret is kept and the account named; an account with no record moves as before.
+- Covered: `test/mfa.test.ts`, one test for each.
+- Gaps skipped (and why): the docs-only CI gate is workflow plumbing.
+
 ## 2026-11-10: full self-audit
 
 Read the README, `docs/decisions.md`, ADR 0001 and `src/`, and mapped each promise to `test/mfa.test.ts`. The baseline was 29 tests. It's now 44. Every test runs against a real Payload 3.92 with an in-memory MongoDB. Nothing here is mocked except the limiter in the key test and the clock (backdated state).
