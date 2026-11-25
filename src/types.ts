@@ -32,7 +32,23 @@ export type MfaState = {
 export type MfaUser = { id: string | number; email?: string | null; collection?: string; hash?: string | null; sessions?: { id: string; createdAt?: string | Date; expiresAt?: string | Date }[] | null; _sid?: string } & Record<string, unknown>
 
 export type MfaEvent = {
-  type: 'started' | 'confirmed' | 'turned-off' | 'recovery-renewed' | 'recovery-used' | 'email-code-sent' | 'email-codes-blocked' | 'enrollment-window' | 'too-many-tries' | 'reset'
+  type:
+    | 'started'
+    | 'confirmed'
+    | 'turned-off'
+    | 'recovery-renewed'
+    | 'recovery-used'
+    | 'email-code-sent'
+    | 'email-codes-blocked'
+    | 'enrollment-window'
+    | 'too-many-tries'
+    | 'reset'
+    | 'passkey-added'
+    | 'passkey-removed'
+    | 'passkey-renamed'
+    | 'passkey-signed-in'
+    | 'passkey-refused'
+  /** The account's id, or an empty string when a refused passkey sign-in never named one. */
   user: string
   req?: PayloadRequest
   /** Never a code, a secret or an address. */
@@ -40,9 +56,22 @@ export type MfaEvent = {
 }
 
 /** What the limiter counts. Keys are built by the plugin, never by a caller. */
-export type LimitKind = 'code' | 'emailCode' | 'code-address' | 'emailCode-address'
+export type LimitKind = 'code' | 'emailCode' | 'code-address' | 'emailCode-address' | 'passkey' | 'passkey-address' | 'passkeyOptions' | 'passkeyOptions-address'
 /** Resolve true to allow. Anything else, or throwing, refuses. */
 export type Limiter = (args: { kind: LimitKind; key: string; req?: PayloadRequest }) => boolean | Promise<boolean>
+
+export type PasskeyOptions = {
+  /** The site's domain, as the browser sees it (`example.com`). A passkey only works for this domain and its subdomains. */
+  rpID: string
+  /** The name the browser shows when asking for a passkey. Default: the `issuer`. */
+  rpName?: string
+  /** Every origin the sign-in page runs on, exactly (`https://example.com`). A response from any other origin is refused. */
+  origins: string[]
+  /** Most passkeys one account may have. Default 10. */
+  maxPerAccount?: number
+  /** How long a challenge lives, in minutes. Default 5. */
+  challengeMinutes?: number
+}
 
 export type MfaOptions = {
   /** The auth collection. Default `users`. */
@@ -67,13 +96,18 @@ export type MfaOptions = {
   /** The site's limiter. Default: a built-in one with hashed keys. */
   limit?: Limiter
   /** Built-in limiter: tries per window, per account. Defaults: 5 codes and 3 email codes per 15 minutes. */
-  limits?: { code?: number; emailCode?: number; windowMinutes?: number }
+  limits?: { code?: number; emailCode?: number; passkey?: number; windowMinutes?: number }
   /** The client's address, for an extra per-address limit on top of the per-account one. Optional. */
   clientAddress?: (req: PayloadRequest) => string | null
   /** Sends an emailed code. Default: `payload.sendEmail` with plain text. */
   sendEmailCode?: (args: { payload: Payload; to: string; code: string; minutes: number; req?: PayloadRequest }) => Promise<unknown>
   /** Every change and refusal worth recording, for an audit trail. */
   onEvent?: (event: MfaEvent) => void | Promise<void>
+  /**
+   * Passkeys (WebAuthn). Off unless this is set. A passkey signs a person in by itself, replacing the password and
+   * the code. The authenticator app and recovery codes stay as the fallback.
+   */
+  passkeys?: PasskeyOptions
   /** Add `POST /api/<users>/mfa/login` for sites without server actions. Default false. */
   endpoint?: boolean
 }
@@ -82,6 +116,9 @@ export type Resolved = Required<Pick<MfaOptions, 'users' | 'issuer' | 'rememberH
   Pick<MfaOptions, 'requiredFor' | 'limit' | 'clientAddress' | 'sendEmailCode' | 'onEvent' | 'legacyUserField'> & {
     stateSlug: string
     keyDerivation: { salt: string; info: string }
-    limits: { code: number; emailCode: number; windowMinutes: number }
+    limits: { code: number; emailCode: number; passkey: number; windowMinutes: number }
     attempts: string
+    passkeyStore: string
+    challenges: string
+    passkeyConfig: (Required<PasskeyOptions>) | null
   }

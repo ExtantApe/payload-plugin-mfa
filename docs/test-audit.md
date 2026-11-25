@@ -1,5 +1,11 @@
 # Test audit
 
+## 2026-11-25: passkeys
+
+- Promises (ADR 0002 and the README section): discoverable, user-verified passkeys; sign-in alone starts a normal Payload session; several named passkeys; a fresh check to add and remove; single-use challenges tied to purpose and account; limits per account and address; one refusal for every sign-in problem; recovery codes and the app still work; reset removes passkeys; events carry no secrets; hidden collections; off unless configured.
+- Covered: `test/passkeys.test.ts`, 38 tests, each promise above with its refusals. Mutation check in the changelog.
+- Gaps skipped (and why): the counter guard in the database write, the challenge purpose check and the proof owner check each sit behind another check that a test does cover, and a deterministic test of the counter race needs two servers. Library internals (signature, RP ID hash, flags) are the library's own tests. Real browsers and devices are for a manual run on a site.
+
 ## 2026-11-22: the old-secret merge
 
 - Promises: an old secret is merged into a record that has none, keeping the record's own fields; a record left by turnOff or a maintainer reset is a deliberate clear, so the old field is left alone; a record with a different secret is kept and the account named; an account with no record moves as before.

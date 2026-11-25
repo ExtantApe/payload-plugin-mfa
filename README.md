@@ -1,8 +1,8 @@
 # payload-plugin-mfa
 
-MFA for Payload (two-step sign-in): an authenticator code after the password, with emailed and recovery codes as backups, each used once, limited per account, and required by a rule you set.
+MFA for Payload: sign in with a passkey, or with an authenticator code after the password. Emailed and recovery codes are backups, each used once, limited per account, and required by a rule you set.
 
-**Status:** early. 0.1.0 is on npm (2026-11-13). The `moveLegacyState` fixes under Unreleased in the changelog are on main, not released yet. 46 tests pass against a real Payload 3.92 with an in-memory MongoDB, covering every factor, replays, the limits (including 40 tries at once), remembered browsers, per-session expiry, the required rule, the login endpoint, and races with Payload's own sign-in (a sign-in begun earlier can't undo two-step or reuse a code). It's extracted from the version a live site runs, but this package itself isn't in use on any site yet, and it has no screens of its own: your site builds the sign-in and settings pages.
+**Status:** early. 0.1.0 is on npm (2026-11-13). The `moveLegacyState` fixes and passkeys under Unreleased in the changelog are not released yet. Passkeys have been tested only against a software authenticator in the test suite, never on a real device or in a browser. 88 tests pass against a real Payload 3.92 with an in-memory MongoDB, covering every factor, replays, the limits (including 40 tries at once), remembered browsers, per-session expiry, the required rule, the login endpoint, and races with Payload's own sign-in (a sign-in begun earlier can't undo two-step or reuse a code). It's extracted from the version a live site runs, but this package itself isn't in use on any site yet, and it has no screens of its own: your site builds the sign-in and settings pages.
 
 ## What it does
 
@@ -65,6 +65,26 @@ HTTP can't carry the code: it travels in `req.context`, which only your server c
   - It sends a `reset` event with `by`: pass the maintainer's id as `actor`, never an email address. If your `onEvent` throws, the reset has still happened.
   - A block on emailed codes after a password reset stays.
   - Neither function has an endpoint.
+
+## Passkeys
+
+Off until you set `passkeys`. A passkey signs a person in by itself, with no password and no code. The authenticator app and recovery codes stay as the fallback. The design is in `docs/adr/0002-passkeys.md`.
+
+```ts
+mfa({ passkeys: { rpID: 'example.com', origins: ['https://example.com'], rpName: 'Example' } })
+```
+
+- **Browser side is yours.** Use `@simplewebauthn/browser` (`startAuthentication`, `startRegistration`) on your pages. The plugin gives you the options and checks the answer.
+- **Sign in:** `passkeySignInOptions(payload, { req })` returns `{ token, options }`. Send `options` to the browser, then pass `{ token, response }` to `passkeySignIn(payload, { token, response, req })`. It returns `{ token, exp, sid, user }` after starting a normal Payload session, with your collection's login hooks run. Set the cookie from `token`. With `endpoint: true` the same two steps are `POST /api/users/mfa/passkey/options` and `POST /api/users/mfa/passkey/sign-in`, which sets the cookie.
+- **Add one:** `beginPasskey(payload, { userId, proof })` then `finishPasskey(payload, { userId, token, response, name })`. Every passkey needs a name. Check the password first. If the account already has an app or a passkey, `proof` is needed too.
+- **A fresh check** (`proof`) is `{ code }` (an app or recovery code) or `{ passkey: { token, response } }` from `passkeyProofOptions(payload, { userId })`. `removePasskey(payload, { userId, id, proof })` always needs one.
+- **Manage:** `listPasskeys` gives names and dates, never keys. `renamePasskey` changes a name. Up to 10 passkeys per account (`maxPerAccount`).
+- **Always the person's own check.** Passkeys must be discoverable and need the fingerprint, face or PIN. A bare tap is refused.
+- **One refusal.** Every sign-in problem gives `MfaRefused` with reason `wrongPasskey`, and the endpoint answers one 401. Challenges work once and last 5 minutes.
+- **Limits:** 10 tries per account per 15 minutes (`limits.passkey`), and per address when you give `clientAddress`. Give `clientAddress` on a public site, or nothing limits who can ask for a challenge.
+- **A maintainer's `resetFor`** also removes the account's passkeys (`keepPasskeys: true` keeps them).
+- **Events:** `passkey-added`, `passkey-removed`, `passkey-renamed`, `passkey-signed-in` and `passkey-refused`. None carry a key, a credential id, a name or an address.
+- **Not covered:** attestation checks, Hats step-up with a passkey, and any screen. An account that must have two-step and has only a passkey can't sign in with its password; it uses the passkey.
 
 ## Moving from state kept on the account
 

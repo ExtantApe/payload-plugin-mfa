@@ -17,22 +17,15 @@ import {
   saveIfUnchanged,
   MFA_CODE,
   MFA_REMEMBER,
+  MfaRefused,
   withSession,
 } from './core.js'
+import { removeAllPasskeys } from './passkeys.js'
 import type { MfaState, MfaUser } from './types.js'
 
-const HOUR = 60 * 60_000
+export { MfaRefused }
 
-/** A refusal a site can show, with a stable reason. */
-export class MfaRefused extends Error {
-  constructor(
-    readonly reason: 'notFound' | 'notOn' | 'alreadyOn' | 'needsCode' | 'wrongCode' | 'tooMany' | 'noPending' | 'busy',
-    message: string,
-  ) {
-    super(message)
-    this.name = 'MfaRefused'
-  }
-}
+const HOUR = 60 * 60_000
 
 const refuse = (reason: MfaRefused['reason'], message: string): never => {
   throw new MfaRefused(reason, message)
@@ -228,11 +221,11 @@ export async function statusFor(payload: Payload, userId: string | number, req?:
  * Opens an enrollment window (default 24 hours) so a required account can sign in to set up again, clears the
  * account's limiter tries, signs the account out everywhere (`endSessions`, default true: a stolen phone may
  * have a session open), and records a `reset` event with who did it (an id, never an address). A block on emailed
- * codes after a password reset is kept. Server-only: the site checks the maintainer and confirms who they're
+ * codes after a password reset is kept. Passkeys are removed too (`keepPasskeys: true` keeps them). Server-only: the site checks the maintainer and confirms who they're
  * resetting. The window lets whoever knows the password set up a phone, so keep it short, and reset the
  * password too if it may be known.
  */
-export async function resetFor(payload: Payload, userId: string | number, args: { enrollHours?: number; actor?: string | number | null; endSessions?: boolean; req?: PayloadRequest } = {}) {
+export async function resetFor(payload: Payload, userId: string | number, args: { enrollHours?: number; actor?: string | number | null; endSessions?: boolean; keepPasskeys?: boolean; req?: PayloadRequest } = {}) {
   const hours = args.enrollHours ?? 24
   if (!(hours > 0 && hours <= 24 * 14)) throw new Error('mfa: enrollHours must be more than 0 and at most 336 (14 days).')
   const user = await loadUser(payload, userId, args.req)
@@ -256,9 +249,11 @@ export async function resetFor(payload: Payload, userId: string | number, args: 
     }
     if (await saveIfUnchanged(payload, user!.id, loaded, cleared, args.req)) {
       await clearAccountTries(payload, user!.id, args.req)
+      // A lost phone may hold a passkey too: they go unless the maintainer keeps them.
+      const passkeys = args.keepPasskeys ? 0 : await removeAllPasskeys(payload, user!.id, args.req)
       // Payload keeps the account's open sessions on the account itself: emptying them signs it out everywhere.
       if (args.endSessions !== false) await payload.db.updateOne({ collection: optionsOf(payload).users, where: { id: { equals: user!.id } } as never, data: { sessions: [] }, ...(args.req ? { req: args.req } : {}) })
-      await emit(payload, { type: 'reset', user: String(user!.id), req: args.req, detail: { by: args.actor === undefined || args.actor === null ? null : String(args.actor), hours } })
+      await emit(payload, { type: 'reset', user: String(user!.id), req: args.req, detail: { by: args.actor === undefined || args.actor === null ? null : String(args.actor), hours, ...(optionsOf(payload).passkeyConfig ? { passkeysRemoved: passkeys } : {}) } })
       return
     }
   }

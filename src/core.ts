@@ -118,7 +118,7 @@ export async function saveIfUnchanged(payload: Payload, userId: string | number,
  */
 async function builtIn(payload: Payload, kind: LimitKind, key: string): Promise<boolean> {
   const o = optionsOf(payload)
-  const max = kind.startsWith('emailCode') ? o.limits.emailCode : o.limits.code
+  const max = kind.startsWith('emailCode') ? o.limits.emailCode : kind.startsWith('passkey') ? o.limits.passkey : o.limits.code
   const keyHash = createHash('sha256').update(`${payload.secret}|mfa|${kind}|${key}`).digest('hex')
   const now = Date.now()
   const at = new Date(now).toISOString()
@@ -138,16 +138,16 @@ async function builtIn(payload: Payload, kind: LimitKind, key: string): Promise<
 export async function clearAccountTries(payload: Payload, userId: string | number, req?: PayloadRequest) {
   const o = optionsOf(payload)
   if (o.limit) return
-  const hashes = (['code', 'emailCode'] as const).map((kind) => createHash('sha256').update(`${payload.secret}|mfa|${kind}|account:${String(userId)}`).digest('hex'))
+  const hashes = (['code', 'emailCode', 'passkey'] as const).map((kind) => createHash('sha256').update(`${payload.secret}|mfa|${kind}|account:${String(userId)}`).digest('hex'))
   await payload.db.deleteMany({ collection: o.attempts, where: { keyHash: { in: hashes } } as never, ...(req ? { req } : {}) })
 }
 
 /** True to allow. Refuses on any error (fails closed). */
-export async function allowed(payload: Payload, kind: 'code' | 'emailCode', userId: string | number, req?: PayloadRequest): Promise<boolean> {
+export async function allowed(payload: Payload, kind: 'code' | 'emailCode' | 'passkey' | 'passkeyOptions', userId: string | number | null, req?: PayloadRequest): Promise<boolean> {
   const o = optionsOf(payload)
   const check = async (k: LimitKind, key: string) => (o.limit ? (await o.limit({ kind: k, key, req })) === true : builtIn(payload, k, key))
   try {
-    if (!(await check(kind, `account:${String(userId)}`))) return false
+    if (userId !== null && !(await check(kind, `account:${String(userId)}`))) return false
     const address = req && o.clientAddress ? o.clientAddress(req) : null
     if (address && !(await check(`${kind}-address` as LimitKind, `address:${address}`))) return false
     return true
@@ -261,3 +261,35 @@ export function sessionBeforeReset(state: MfaState, user: MfaUser): boolean {
 }
 
 export const inEnrollWindow = (s: MfaState, now = Date.now()) => Boolean(s.enrollUntil && new Date(s.enrollUntil).getTime() > now)
+
+// ------------------------------------------------------------------------------------------------
+// Accounts whose two-step state still sits in the old field (`legacyUserField`)
+
+type RawUsers = {
+  base?: { Types?: { ObjectId?: new (s: string) => unknown } }
+  collection: { find: (q: object, opts?: object) => { toArray: () => Promise<Record<string, unknown>[]> }; updateOne: (q: object, u: object) => Promise<unknown>; countDocuments: (q: object) => Promise<number> }
+}
+export const rawUsers = (payload: Payload, o: Resolved): RawUsers => {
+  const users = (payload.db as unknown as { collections?: Record<string, RawUsers> }).collections?.[o.users]
+  if (!users) throw new Error('mfa: `legacyUserField` needs the MongoDB adapter.')
+  return users
+}
+
+/** While an account still has state in the old field, it can't sign in: it can't run half-moved and weaker. */
+export async function hasUnmovedState(payload: Payload, o: Resolved, userId: string | number) {
+  const users = rawUsers(payload, o)
+  const ObjectId = users.base?.Types?.ObjectId
+  const id = ObjectId && /^[a-f0-9]{24}$/i.test(String(userId)) ? new ObjectId(String(userId)) : userId
+  return (await users.collection.countDocuments({ _id: id, [o.legacyUserField!]: { $exists: true, $ne: null } })) > 0
+}
+
+/** A refusal a site can show, with a stable reason. */
+export class MfaRefused extends Error {
+  constructor(
+    readonly reason: 'notFound' | 'notOn' | 'alreadyOn' | 'needsCode' | 'wrongCode' | 'tooMany' | 'noPending' | 'busy' | 'passkeysOff' | 'wrongPasskey' | 'badName' | 'tooManyPasskeys',
+    message: string,
+  ) {
+    super(message)
+    this.name = 'MfaRefused'
+  }
+}
