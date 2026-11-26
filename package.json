@@ -1,6 +1,6 @@
 {
   "name": "@extantape/payload-plugin-mfa",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MFA for Payload: sign in with a passkey, or with an authenticator code after the password. Emailed and recovery codes are backups, each used once, rate limited per account, and required by a rule you set.",
   "keywords": [
     "payload",
