@@ -5,17 +5,17 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import {
   allowEnrollment,
-  beginPasskey,
+  beginPasskey as beginRaw,
   codeFor,
   confirm,
   finishPasskey,
   hasPasskeys,
   listPasskeys,
   mfa,
-  passkeyProofOptions,
-  passkeySignIn,
-  passkeySignInOptions,
-  removePasskey,
+  passkeyProofOptions as proofOptionsRaw,
+  passkeySignIn as signInRaw,
+  passkeySignInOptions as signInOptionsRaw,
+  removePasskey as removeRaw,
   renamePasskey,
   resetFor,
   signIn,
@@ -25,7 +25,7 @@ import {
   type MfaEvent,
   type Proof,
 } from '../src/index.js'
-import { optionsOf } from '../src/core.js'
+import { MFA_TRUSTED, optionsOf } from '../src/core.js'
 import { VirtualAuthenticator, type Knobs } from './authenticator.js'
 
 /** A made-up site with passkeys on. Staff must have a second step; members may. Everything is in memory. */
@@ -47,6 +47,15 @@ const reqWith = async (headers: Record<string, string> = {}) => {
   return req
 }
 const ip = (address: string) => reqWith({ 'x-test-ip': address })
+// Most tests don't care which address they come from, so each call gets its own. A call with no address at all
+// shares one limited bucket, and the limits tests call the plugin directly to prove that.
+let addresses = 0
+const fresh = () => ip(`10.${Math.floor(++addresses / 250)}.${addresses % 250}.7`)
+const beginPasskey = async (p: Payload, a: Parameters<typeof beginRaw>[1]) => beginRaw(p, { ...a, req: a.req ?? (await fresh()) })
+const passkeyProofOptions = async (p: Payload, a: Parameters<typeof proofOptionsRaw>[1]) => proofOptionsRaw(p, { ...a, req: a.req ?? (await fresh()) })
+const removePasskey = async (p: Payload, a: Parameters<typeof removeRaw>[1]) => removeRaw(p, { ...a, req: a.req ?? (await fresh()) })
+const passkeySignInOptions = async (p: Payload, a: { req?: PayloadRequest } = {}) => signInOptionsRaw(p, { req: a.req ?? (await fresh()) })
+const passkeySignIn = async (p: Payload, a: { token: unknown; response: unknown; req?: PayloadRequest }) => signInRaw(p, { ...a, req: a.req ?? (await fresh()) })
 
 /** Adds a passkey to an account the way a person's device would. Returns the device and the saved passkey. */
 async function addPasskey(u: U, name = 'Test laptop', device = new VirtualAuthenticator(), proof?: Proof) {
@@ -99,6 +108,31 @@ beforeAll(async () => {
             if (String((user as { email?: string }).email).startsWith('blocked-')) throw new Error('a site rule says no')
           }],
           afterLogin: [({ user }) => void hookLog.push(`after:${String((user as { email?: string }).email)}`)],
+          // The operation hooks Payload's own login runs. They also run for other operations, so each one looks for `login`.
+          beforeOperation: [
+            ({ operation, args }) => {
+              if (operation !== 'login') return
+              const email = String((args as { data?: { email?: string } }).data?.email)
+              hookLog.push(`beforeOperation:${email}`)
+              if (email.startsWith('opblocked-')) throw new Error('a site rule says no, before the sign-in')
+            },
+          ],
+          afterOperation: [
+            ({ operation, req }) => {
+              if (operation !== 'login') return undefined as never
+              const email = String((req.user as { email?: string } | null)?.email)
+              hookLog.push(`afterOperation:${email}`)
+              if (email.startsWith('afterblocked-')) throw new Error('a site rule says no, after the sign-in')
+              return undefined as never
+            },
+          ],
+          // Payload reads the signed-in user through the read pipeline. This hook refuses it only for the plugin's own trusted request.
+          afterRead: [
+            ({ doc, context }) => {
+              if (context[MFA_TRUSTED] && String((doc as { email?: string }).email).startsWith('banned-')) throw new Error('a site rule hides this account')
+              return doc
+            },
+          ],
         },
       },
     ],
@@ -323,12 +357,39 @@ describe('signing in with a passkey', () => {
     const { device } = await addPasskey(u)
     hookLog.length = 0
     await viaPasskey(device)
-    expect(hookLog).toEqual([`before:${u.email}`, `after:${u.email}`])
+    expect(hookLog.filter((h) => !h.includes('Operation'))).toEqual([`before:${u.email}`, `after:${u.email}`])
     const blocked = await payload.create({ collection: 'users', data: { email: `blocked-${++n}@example.invalid`, password: PW } as never }) as unknown as U
     const { device: d2 } = await addPasskey(blocked)
     const before = await sessionsOf(blocked)
     expect(await reasonOf(viaPasskey(d2))).toBe('wrongPasskey')
     expect(await sessionsOf(blocked)).toBe(before)
+  })
+
+  it('runs every step of Payload’s own login: operation hooks, the read pipeline and the failed-attempt count', async () => {
+    const u = await make()
+    const { device } = await addPasskey(u)
+    await payload.db.updateOne({ collection: 'users', where: { id: { equals: u.id } } as never, data: { loginAttempts: 3 }, returning: false })
+    hookLog.length = 0
+    await viaPasskey(device)
+    // The same order a password login uses, with the operation hooks around the login hooks.
+    expect(hookLog).toEqual([`beforeOperation:${u.email}`, `before:${u.email}`, `after:${u.email}`, `afterOperation:${u.email}`])
+    const after = (await payload.findByID({ collection: 'users', id: u.id, overrideAccess: true, showHiddenFields: true, depth: 0 })) as unknown as { loginAttempts?: number }
+    expect(after.loginAttempts).toBe(0)
+    // A beforeOperation hook that throws stops the sign-in before any session exists.
+    const early = (await payload.create({ collection: 'users', data: { email: `opblocked-${++n}@example.invalid`, password: PW } as never })) as unknown as U
+    const e = await addPasskey(early)
+    expect(await reasonOf(viaPasskey(e.device))).toBe('wrongPasskey')
+    expect(await sessionsOf(early)).toBe(0)
+    // So does an afterOperation hook that throws, even though the session and token already exist: it is rolled back.
+    const late = (await payload.create({ collection: 'users', data: { email: `afterblocked-${++n}@example.invalid`, password: PW } as never })) as unknown as U
+    const l = await addPasskey(late)
+    expect(await reasonOf(viaPasskey(l.device))).toBe('wrongPasskey')
+    expect(await sessionsOf(late)).toBe(0)
+    // So does a read rule that hides the account (the account would otherwise have been signed in).
+    const hidden = (await payload.create({ collection: 'users', data: { email: `banned-${++n}@example.invalid`, password: PW } as never })) as unknown as U
+    const h = await addPasskey(hidden)
+    expect(await reasonOf(viaPasskey(h.device))).toBe('wrongPasskey')
+    expect(await sessionsOf(hidden)).toBe(0)
   })
 
   it('refuses a locked account', async () => {
@@ -432,6 +493,60 @@ describe('signing in with a passkey', () => {
   })
 })
 
+describe('challenge guards', () => {
+  const countOf = async (u: U) => (await listPasskeys(payload, u.id)).length
+  /** An assertion a device makes over a challenge it was handed, with everything else about it correct. */
+  const answerFor = (device: VirtualAuthenticator, challenge: string) => device.get({ challenge, rpId: RP }, ORIGIN)
+
+  it('purpose: a challenge made for one job can’t do another, even when everything else about the answer is right', async () => {
+    const u = await make()
+    const { device } = await addPasskey(u)
+    // A proof challenge used to sign in.
+    const proofOpts = await passkeyProofOptions(payload, { userId: u.id })
+    expect(await reasonOf(passkeySignIn(payload, { token: proofOpts.token, response: answerFor(device, proofOpts.options.challenge) }))).toBe('wrongPasskey')
+    // A proof challenge answered for its own job works: it starts a registration.
+    const again = await passkeyProofOptions(payload, { userId: u.id })
+    const extra = new VirtualAuthenticator()
+    const ok = await beginPasskey(payload, { userId: u.id, proof: { passkey: { token: again.token, response: answerFor(device, again.options.challenge) } } })
+    // A registration challenge answered with a sign-in: the browser's answer is a good assertion over the registration challenge.
+    expect(await reasonOf(passkeySignIn(payload, { token: ok.token, response: answerFor(device, ok.options.challenge) }))).toBe('wrongPasskey')
+    // A sign-in challenge used to register: a good registration over the sign-in challenge.
+    const signin = await passkeySignInOptions(payload)
+    const before = await countOf(u)
+    const created = extra.create({ challenge: signin.options.challenge, rp: { id: RP }, user: { id: Buffer.from('x').toString('base64url') } }, ORIGIN)
+    expect(await reasonOf(finishPasskey(payload, { userId: u.id, token: signin.token, response: created, name: 'Wrong job' }))).toBe('wrongPasskey')
+    // A proof challenge used to register, for the very same account.
+    const proof2 = await passkeyProofOptions(payload, { userId: u.id })
+    const created2 = extra.create({ challenge: proof2.options.challenge, rp: { id: RP }, user: { id: Buffer.from('y').toString('base64url') } }, ORIGIN)
+    expect(await reasonOf(finishPasskey(payload, { userId: u.id, token: proof2.token, response: created2, name: 'Wrong job' }))).toBe('wrongPasskey')
+    expect(await countOf(u)).toBe(before)
+    // Refusing it used the challenge up: the right job can't use it afterwards either.
+    expect(await reasonOf(removePasskey(payload, { userId: u.id, id: (await listPasskeys(payload, u.id))[0]!.id, proof: { passkey: { token: proof2.token, response: answerFor(device, proof2.options.challenge) } } }))).toBe('wrongPasskey')
+  })
+
+  it('owner: a challenge made for one account can’t be used by another, even when everything else about the answer is right', async () => {
+    const a = await make()
+    const b = await make()
+    const da = (await addPasskey(a, 'A device')).device
+    const db = (await addPasskey(b, 'B device')).device
+    // A's proof challenge, answered by B's own device for B: B's credential and B's account are right; only the owner is wrong.
+    const pa = await passkeyProofOptions(payload, { userId: a.id })
+    const [bOnly] = await listPasskeys(payload, b.id)
+    expect(await reasonOf(removePasskey(payload, { userId: b.id, id: bOnly!.id, proof: { passkey: { token: pa.token, response: answerFor(db, pa.options.challenge) } } }))).toBe('wrongPasskey')
+    expect(await countOf(b)).toBe(1)
+    // A's registration challenge, finished as B with a good registration from a new device.
+    const reg = await beginPasskey(payload, { userId: a.id, proof: await (async () => { const p = await passkeyProofOptions(payload, { userId: a.id }); return { passkey: { token: p.token, response: answerFor(da, p.options.challenge) } } })() })
+    const fresh2 = new VirtualAuthenticator()
+    const created = fresh2.create({ challenge: reg.options.challenge, rp: { id: RP }, user: { id: reg.options.user.id } }, ORIGIN)
+    expect(await reasonOf(finishPasskey(payload, { userId: b.id, token: reg.token, response: created, name: 'Not mine' }))).toBe('wrongPasskey')
+    expect(await countOf(b)).toBe(1)
+    // The owner's own challenge was used up by the refusal; a new one works for its owner.
+    const again = await beginPasskey(payload, { userId: a.id, proof: await (async () => { const p = await passkeyProofOptions(payload, { userId: a.id }); return { passkey: { token: p.token, response: answerFor(da, p.options.challenge) } } })() })
+    const fine = new VirtualAuthenticator().create({ challenge: again.options.challenge, rp: { id: RP }, user: { id: again.options.user.id } }, ORIGIN)
+    expect(await reasonOf(finishPasskey(payload, { userId: a.id, token: again.token, response: fine, name: 'Fine' }))).toBe('ok')
+  })
+})
+
 describe('removing passkeys', () => {
   it('needs a fresh check every time, and takes an app code, a recovery code or a passkey', async () => {
     const u = await make()
@@ -513,6 +628,41 @@ describe('limits', () => {
     for (let i = 0; i < 40; i++) if ((await reasonOf(passkeySignInOptions(payload, { req }))) === 'tooMany') refused++
     expect(refused).toBeGreaterThan(0)
     expect(await reasonOf(passkeySignInOptions(payload, { req: await ip('203.0.113.51') }))).toBe('ok')
+  })
+
+  it('still limits when no address is known: one shared bucket, so nobody can guess without limit', async () => {
+    const noAddress = await reqWith()
+    // Asking for challenges, from a call with no request at all and from one whose request carries no address.
+    const asked: string[] = []
+    for (let i = 0; i < 10; i++) asked.push(await reasonOf(i % 2 ? signInOptionsRaw(payload, { req: noAddress }) : signInOptionsRaw(payload)))
+    expect(asked.every((r) => r === 'ok')).toBe(true)
+    expect(await reasonOf(signInOptionsRaw(payload))).toBe('tooMany')
+    expect(await reasonOf(signInOptionsRaw(payload, { req: noAddress }))).toBe('tooMany')
+    // Signing in, too: ten tries, then the eleventh is refused by the limit, whatever it carries.
+    events.length = 0
+    for (let i = 0; i < 10; i++) await reasonOf(signInRaw(payload, { token: 'x', response: {}, ...(i % 2 ? { req: noAddress } : {}) }))
+    expect(events.some((e) => e.type === 'too-many-tries' && e.detail?.what === 'passkey')).toBe(false)
+    expect(await reasonOf(signInRaw(payload, { token: 'x', response: {} }))).toBe('wrongPasskey')
+    expect(events.some((e) => e.type === 'too-many-tries' && e.detail?.what === 'passkey')).toBe(true)
+    expect(events.some((e) => e.type === 'passkey-refused' && e.detail?.why === 'address-limit')).toBe(true)
+    // An address that is known has its own bucket and still works.
+    expect(await reasonOf(passkeySignInOptions(payload))).toBe('ok')
+  })
+
+  it('hands a site’s own limiter the shared key when no address is known', async () => {
+    const o = optionsOf(payload) as { limit?: (a: { kind: string; key: string }) => boolean }
+    const seen: string[] = []
+    try {
+      o.limit = ({ kind, key }) => {
+        seen.push(`${kind}|${key}`)
+        return !key.endsWith('unknown')
+      }
+      expect(await reasonOf(signInOptionsRaw(payload))).toBe('tooMany')
+      expect(seen).toContain('passkeyOptions-address|address:unknown')
+      expect(await reasonOf(signInOptionsRaw(payload, { req: await ip('192.0.2.200') }))).toBe('ok')
+    } finally {
+      delete o.limit
+    }
   })
 
   it('refuses when the limiter fails, and when a site limiter says no', async () => {

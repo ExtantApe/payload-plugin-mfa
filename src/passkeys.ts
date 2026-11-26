@@ -11,7 +11,8 @@ import {
   type PublicKeyCredentialRequestOptionsJSON,
   type RegistrationResponseJSON,
 } from '@simplewebauthn/server'
-import { checkLoginPermission, commitTransaction, createLocalReq, getFieldsToSign, initTransaction, jwtSign, killTransaction, type Payload, type PayloadRequest } from 'payload'
+import { checkLoginPermission, commitTransaction, createLocalReq, getFieldsToSign, initTransaction, jwtSign, killTransaction, resetLoginAttempts, type Payload, type PayloadRequest } from 'payload'
+import { applyUserReadAccess } from 'payload/internal'
 import { addSessionToUser } from 'payload/shared'
 
 import { acceptCode, allowed, emit, hasUnmovedState, isOnState, keysOf, loadState, loadUser, MFA_TRUSTED, MfaRefused, optionsOf, saveIfUnchanged, withSession } from './core.js'
@@ -222,7 +223,12 @@ export async function passkeySignIn(payload: Payload, args: { token: unknown; re
   }
 }
 
-/** The part of Payload's `login` that follows a good password: session, token and login hooks, with the sign-in marked as vouched for. */
+/**
+ * The part of Payload's `login` that follows a good password, in the same order: the collection's `beforeOperation`
+ * hooks, the lock and email checks, the session, `resetLoginAttempts`, `beforeLogin`, the token, `afterLogin`, the
+ * read pipeline (`afterRead` access and hooks, hidden fields), and `afterOperation`. A hook that throws ends the
+ * sign-in and rolls back the session. The sign-in is marked as vouched for.
+ */
 async function startSession(payload: Payload, o: Resolved, userId: string, incoming: PayloadRequest | undefined): Promise<PasskeySignInResult> {
   const collection = payload.collections[o.users as never]
   if (!collection) throw new Error('no auth collection')
@@ -230,6 +236,13 @@ async function startSession(payload: Payload, o: Resolved, userId: string, incom
   if (config.auth.disableLocalStrategy) throw new Error('local strategy is off')
   if (o.legacyUserField && (await hasUnmovedState(payload, o, userId))) throw new Error('state not moved')
   const req = (await createLocalReq({ context: { [MFA_TRUSTED]: true }, ...(incoming?.headers ? { req: { headers: incoming.headers } } : {}) } as never, payload)) as PayloadRequest
+  // beforeOperation, as `login` runs it first. It sees the same arguments a password login passes, with the account's email.
+  const known = (await payload.db.findOne({ collection: o.users, where: { id: { equals: userId } } as never, select: { email: true } as never, req })) as { email?: string } | null
+  let args: Record<string, unknown> = { collection, data: { email: known?.email }, overrideAccess: false, req, showHiddenFields: false }
+  for (const hook of config.hooks?.beforeOperation ?? []) {
+    const changed = await hook({ args: args as never, collection: config, context: req.context, operation: 'login', overrideAccess: false, req } as never)
+    if (changed !== undefined) args = changed as never
+  }
   const shouldCommit = await initTransaction(req)
   try {
     const raw = (await payload.db.findOne({ collection: o.users, where: { id: { equals: userId } } as never, req })) as (Record<string, unknown> & { id: string | number; email?: string }) | null
@@ -250,13 +263,23 @@ async function startSession(payload: Payload, o: Resolved, userId: string, incom
       if (i >= 2) throw new Error('could not record the session')
     }
     const fieldsToSign = getFieldsToSign({ collectionConfig: config, email: String(user.email ?? ''), user: user as never, ...(sid ? { sid } : {}) })
+    // A good sign-in clears the failed-password count and any lock, as a good password does.
+    if (config.auth.maxLoginAttempts > 0) await resetLoginAttempts({ collection: config, doc: user as never, payload, req })
     let hooked: unknown = user
     for (const hook of config.hooks?.beforeLogin ?? []) hooked = (await hook({ collection: config, context: req.context, req, user: hooked as never })) || hooked
     const { exp, token } = await jwtSign({ fieldsToSign, secret: payload.secret, tokenExpiration: config.auth.tokenExpiration })
     req.user = hooked as never
     for (const hook of config.hooks?.afterLogin ?? []) hooked = (await hook({ collection: config, context: req.context, req, token, user: hooked as never })) || hooked
+    // The read pipeline `login` runs on the user it returns: field read access and afterRead hooks.
+    const read = (await applyUserReadAccess({ collection: config, overrideAccess: false, req, showHiddenFields: false, user: hooked as never })) as { id: string | number; email?: string | null }
+    let result: unknown = { exp, token, user: read }
+    for (const hook of config.hooks?.afterOperation ?? []) {
+      const changed = await hook({ args: args as never, collection: config, operation: 'login', overrideAccess: false, req, result: result as never } as never)
+      if (changed !== undefined) result = changed
+    }
+    const final = result as { exp: number; token: string; user: { id: string | number; email?: string | null } }
     if (shouldCommit) await commitTransaction(req)
-    return { token, exp, sid, user: { id: user.id, email: user.email ?? null } }
+    return { token: final.token, exp: final.exp, sid, user: { id: final.user.id, email: final.user.email ?? null } }
   } catch (error) {
     await killTransaction(req)
     throw error

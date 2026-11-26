@@ -149,7 +149,13 @@ export async function allowed(payload: Payload, kind: 'code' | 'emailCode' | 'pa
   try {
     if (userId !== null && !(await check(kind, `account:${String(userId)}`))) return false
     const address = req && o.clientAddress ? o.clientAddress(req) : null
-    if (address && !(await check(`${kind}-address` as LimitKind, `address:${address}`))) return false
+    if (address) {
+      if (!(await check(`${kind}-address` as LimitKind, `address:${address}`))) return false
+    } else if (kind === 'passkey' || kind === 'passkeyOptions') {
+      // No address known (none given, no `clientAddress`, or it returned nothing): every such try shares one bucket,
+      // so passkey guessing and challenge requests are always limited. Sites should give `clientAddress`.
+      if (!(await check(`${kind}-address` as LimitKind, 'address:unknown'))) return false
+    }
     return true
   } catch (error) {
     payload.logger.error({ err: error, msg: 'mfa: the limiter failed, so the try was refused' })

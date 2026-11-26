@@ -1,6 +1,6 @@
 # ADR 0002: Passkeys
 
-Status: proposed, 2026-11-25, with the code in the same pull request. Follows a Captive Origins owner decision (D5351, 2026-11-25): "Replaces password and code (Recommended)". ADR 0001 left passkeys for 0.2.
+Status: proposed, 2026-11-25, with the code in the same pull request. Follows an owner decision of 2026-11-25: "Replaces password and code (Recommended)". ADR 0001 left passkeys for 0.2.
 
 ## Context
 
