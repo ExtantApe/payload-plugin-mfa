@@ -291,11 +291,42 @@ describe('races with Payload’s own sign-in', () => {
     expect((await payload.count({ collection: 'mfa-attempts' as never, where: { keyHash: { equals: 'old-try' } }, overrideAccess: true })).totalDocs).toBe(0)
   })
 
-  it('the built-in limit lets at most five of forty tries at once through', async () => {
+  it('the built-in limit lets at most five of forty tries at once through (often none: a burst fails closed)', async () => {
     const u = await make()
     const results = await Promise.all(Array.from({ length: 40 }, () => allowed(payload, 'code', u.id)))
     expect(results.filter(Boolean).length).toBeLessThanOrEqual(5)
-    expect(results.filter(Boolean).length).toBeGreaterThan(0)
+  })
+
+  it('a slow try that stamped its time first can’t get through after a later try already used the last place', async () => {
+    const u = await make()
+    for (let i = 0; i < 4; i++) expect(await allowed(payload, 'code', u.id)).toBe(true)
+    // Hold the next try's write after its time is stamped, so it lands after a later try has been counted.
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    let reached!: () => void
+    const atWrite = new Promise<void>((r) => (reached = r))
+    const original = payload.db.create.bind(payload.db)
+    let held = false
+    payload.db.create = (async (args: any) => {
+      if (!held && args.collection === 'mfa-attempts') {
+        held = true
+        reached()
+        await gate
+      }
+      return original(args)
+    }) as typeof payload.db.create
+    try {
+      const slow = allowed(payload, 'code', u.id)
+      await atWrite
+      await new Promise((r) => setTimeout(r, 5))
+      const later = await allowed(payload, 'code', u.id)
+      release()
+      const results = [await slow, later]
+      expect(results.filter(Boolean).length).toBe(1)
+    } finally {
+      release()
+      payload.db.create = original as never
+    }
   })
 })
 
