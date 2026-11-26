@@ -112,9 +112,12 @@ export async function saveIfUnchanged(payload: Payload, userId: string | number,
 // plus per address on top when the site gives `clientAddress`. Keys are built here, never passed in.
 
 /**
- * Records the try first, then counts the window including it, so tries arriving together can't all see room:
- * under a race some are refused that might have fitted (fails closed), never the other way. Written outside the
- * request's transaction, so a refused sign-in rolling back doesn't erase its try.
+ * Records the try first, then counts every try in the window including it, and allows it only if that count is
+ * within the limit. Whichever allowed try counts last has seen every other allowed try's record, so no more than
+ * the limit ever get through. Under a race some are refused that might have fitted (fails closed), never the
+ * other way. (Ordering by stamped time instead let a slow write with an earlier stamp through after a later try
+ * had taken the last place.) Written outside the request's transaction, so a refused sign-in rolling back
+ * doesn't erase its try.
  */
 async function builtIn(payload: Payload, kind: LimitKind, key: string): Promise<boolean> {
   const o = optionsOf(payload)
@@ -122,13 +125,12 @@ async function builtIn(payload: Payload, kind: LimitKind, key: string): Promise<
   const keyHash = createHash('sha256').update(`${payload.secret}|mfa|${kind}|${key}`).digest('hex')
   const now = Date.now()
   const at = new Date(now).toISOString()
-  const mine = (await payload.create({ collection: o.attempts as never, data: { keyHash, at } as never, overrideAccess: true })) as unknown as { id: string | number }
+  await payload.create({ collection: o.attempts as never, data: { keyHash, at } as never, overrideAccess: true })
   const since = new Date(now - o.limits.windowMinutes * 60_000).toISOString()
-  // Allowed only if this try is among the window's first `max`, ordered by time then id, the same for every request.
-  const { docs } = await payload.find({ collection: o.attempts as never, where: { and: [{ keyHash: { equals: keyHash } }, { at: { greater_than: since } }] } as never, sort: ['at', 'id'], limit: max, depth: 0, overrideAccess: true, pagination: false })
+  const { totalDocs } = await payload.count({ collection: o.attempts as never, where: { and: [{ keyHash: { equals: keyHash } }, { at: { greater_than: since } }] } as never, overrideAccess: true })
   // Tries older than the window can't count any more: delete them, so refused tries can't grow the table without end.
   await payload.db.deleteMany({ collection: o.attempts, where: { at: { less_than: since } } as never }).catch((err: unknown) => payload.logger.warn({ err, msg: 'mfa: old tries weren’t cleared; they will be next time' }))
-  return (docs as unknown as { id: string | number }[]).some((d) => String(d.id) === String(mine.id))
+  return totalDocs <= max
 }
 
 /**

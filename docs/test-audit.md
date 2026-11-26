@@ -1,5 +1,12 @@
 # Test audit
 
+## 2026-11-26: the built-in limiter's race, found by the 0.2.0 release run
+
+- Promise: no more than the limit of tries get through per account and window, however they arrive.
+- The 0.2.0 Release workflow failed: 6 of 40 tries at once got through. The limiter allowed a try if it was among the window's first five by stamped time, and the time is stamped before the write, so a slow write with an earlier stamp got through after a later try had taken the last place.
+- Gap added: "a slow try that stamped its time first…" holds one try's write after its stamp, runs a later try to the end, then releases it. It failed on the old code (2 of 1 place) and passes now. The limiter now counts every try in the window after recording its own and allows it only if the count is within the limit.
+- Changed: the 40-at-once test keeps its upper bound and drops "at least one gets through". A burst now usually refuses all of them, which is the fail-closed side the limiter already promised. Sequential limits stay covered by the per-account, `verify()` and per-address tests.
+
 ## 2026-11-26: passkeys, after the first two reviews
 
 - Promises added since the last entry: passkey sign-in runs Payload's login steps (operation hooks, read pipeline, failed-attempt reset) and any hook can refuse; trashed accounts can't sign in; with no known address, passkey tries share one limited bucket and a sign-in uses one try; limits must be whole numbers of at least 1; challenge purpose and owner are enforced; two answers at one counter can't both pass.
@@ -149,7 +156,7 @@ Each promise in the README and ADR 0001, and the test that proves it (`test/mfa.
 | Startup refusals (short secret, no auth collection, API keys) | "with a short app secret…" |
 | A sign-in begun earlier can't turn two-step off | "a sign-in that began before two-step was confirmed…" (the reviewer's repro) |
 | A recovery code signs in once against an earlier-begun sign-in | "one recovery code signs in once…" (the reviewer's repro) |
-| The limiter holds under 40 tries at once | "the built-in limit lets at most five…" (fails with count-then-record) |
+| The limiter holds under 40 tries at once, and against a slow write stamped first | "the built-in limit lets at most five…" (fails with count-then-record), "a slow try that stamped its time first…" (fails with first-by-time) |
 | Old state: refused until moved, moved by an explicit run (repeatable), then signs in | "refuses an account with unmoved state…" (also proves the raw-secret key) |
 | Old tries are deleted | "deletes tries older than the window…" |
 
