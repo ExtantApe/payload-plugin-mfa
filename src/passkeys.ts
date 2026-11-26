@@ -201,7 +201,7 @@ export async function passkeySignIn(payload: Payload, args: { token: unknown; re
   const known = credentialId ? await passkeyByCredential(payload, credentialId).catch(() => null) : null
   if (!known) return refuseSignIn(payload, req, '', 'unknown-passkey')
   // Every try for an account counts, good or bad, so a stolen device can't be tried without end.
-  if (!(await allowed(payload, 'passkey', known.user, req))) {
+  if (!(await allowed(payload, 'passkey', known.user, req, { addressAlreadyCounted: true }))) {
     await emit(payload, { type: 'too-many-tries', user: known.user, req, detail: { what: 'passkey' } })
     return refuseSignIn(payload, req, known.user, 'account-limit')
   }
@@ -237,7 +237,8 @@ async function startSession(payload: Payload, o: Resolved, userId: string, incom
   if (o.legacyUserField && (await hasUnmovedState(payload, o, userId))) throw new Error('state not moved')
   const req = (await createLocalReq({ context: { [MFA_TRUSTED]: true }, ...(incoming?.headers ? { req: { headers: incoming.headers } } : {}) } as never, payload)) as PayloadRequest
   // beforeOperation, as `login` runs it first. It sees the same arguments a password login passes, with the account's email.
-  const known = (await payload.db.findOne({ collection: o.users, where: { id: { equals: userId } } as never, select: { email: true } as never, req })) as { email?: string } | null
+  const notTrashed = (where: Record<string, unknown>) => (config.trash ? { and: [where, { deletedAt: { exists: false } }] } : where)
+  const known = (await payload.db.findOne({ collection: o.users, where: notTrashed({ id: { equals: userId } }) as never, select: { email: true } as never, req })) as { email?: string } | null
   let args: Record<string, unknown> = { collection, data: { email: known?.email }, overrideAccess: false, req, showHiddenFields: false }
   for (const hook of config.hooks?.beforeOperation ?? []) {
     const changed = await hook({ args: args as never, collection: config, context: req.context, operation: 'login', overrideAccess: false, req } as never)
@@ -245,7 +246,8 @@ async function startSession(payload: Payload, o: Resolved, userId: string, incom
   }
   const shouldCommit = await initTransaction(req)
   try {
-    const raw = (await payload.db.findOne({ collection: o.users, where: { id: { equals: userId } } as never, req })) as (Record<string, unknown> & { id: string | number; email?: string }) | null
+    // Trashed accounts can't sign in, as in Payload's `login`.
+    const raw = (await payload.db.findOne({ collection: o.users, where: notTrashed({ id: { equals: userId } }) as never, req })) as (Record<string, unknown> & { id: string | number; email?: string }) | null
     if (!raw) throw new Error('no account')
     delete raw._id
     delete raw.__v

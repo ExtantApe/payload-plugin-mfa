@@ -81,7 +81,7 @@ mfa({ passkeys: { rpID: 'example.com', origins: ['https://example.com'], rpName:
 - **Manage:** `listPasskeys` gives names and dates, never keys. `renamePasskey` changes a name. Up to 10 passkeys per account (`maxPerAccount`).
 - **Always the person's own check.** Passkeys must be discoverable and need the fingerprint, face or PIN. A bare tap is refused.
 - **One refusal.** Every sign-in problem gives `MfaRefused` with reason `wrongPasskey`, and the endpoint answers one 401. Challenges work once and last 5 minutes.
-- **Limits:** 10 tries per account per 15 minutes (`limits.passkey`), and per address when you give `clientAddress`. Give `clientAddress` on a public site, or nothing limits who can ask for a challenge.
+- **Limits:** 10 tries per account per 15 minutes (`limits.passkey`), and per address when you give `clientAddress`. Challenge requests are limited too. Give `clientAddress` on a public site. Without a known address, every request shares one bucket of `limits.passkey` tries per window, so guessing stays limited but one busy period can lock everyone out. Every `limits.*` value and `windowMinutes` must be a whole number of at least 1.
 - **A maintainer's `resetFor`** also removes the account's passkeys (`keepPasskeys: true` keeps them).
 - **Events:** `passkey-added`, `passkey-removed`, `passkey-renamed`, `passkey-signed-in` and `passkey-refused`. None carry a key, a credential id, a name or an address.
 - **Not covered:** attestation checks, Hats step-up with a passkey, and any screen. An account that must have two-step and has only a passkey can't sign in with its password; it uses the passkey.

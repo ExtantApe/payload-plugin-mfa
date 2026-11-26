@@ -143,11 +143,13 @@ export async function clearAccountTries(payload: Payload, userId: string | numbe
 }
 
 /** True to allow. Refuses on any error (fails closed). */
-export async function allowed(payload: Payload, kind: 'code' | 'emailCode' | 'passkey' | 'passkeyOptions', userId: string | number | null, req?: PayloadRequest): Promise<boolean> {
+export async function allowed(payload: Payload, kind: 'code' | 'emailCode' | 'passkey' | 'passkeyOptions', userId: string | number | null, req?: PayloadRequest, opts: { addressAlreadyCounted?: boolean } = {}): Promise<boolean> {
   const o = optionsOf(payload)
   const check = async (k: LimitKind, key: string) => (o.limit ? (await o.limit({ kind: k, key, req })) === true : builtIn(payload, k, key))
   try {
     if (userId !== null && !(await check(kind, `account:${String(userId)}`))) return false
+    // A sign-in that already counted its address (the first check) counts only the account here: one try per sign-in.
+    if (opts.addressAlreadyCounted) return true
     const address = req && o.clientAddress ? o.clientAddress(req) : null
     if (address) {
       if (!(await check(`${kind}-address` as LimitKind, `address:${address}`))) return false

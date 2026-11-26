@@ -377,6 +377,7 @@ export const mfa =
       attempts: 'mfa-attempts',
       stateSlug: 'mfa-state',
     }
+    for (const [name, value] of Object.entries(o.limits)) if (!Number.isInteger(value) || value < 1) throw new Error(`mfa: limits.${name} must be a whole number of at least 1 (anything lower switches the limiter off).`)
     if (!config.secret || config.secret.length < 32) throw new Error('mfa: the app secret must be at least 32 characters (it seals the authenticator secrets).')
     const users = (config.collections ?? []).find((c) => c.slug === o.users)
     if (!users?.auth) throw new Error(`mfa: no auth collection "${o.users}".`)

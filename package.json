@@ -56,7 +56,7 @@
     "otpauth": "9.6.0"
   },
   "peerDependencies": {
-    "payload": "^3.80.0"
+    "payload": "^3.90.0"
   },
   "devDependencies": {
     "@payloadcms/db-mongodb": "3.92.1",

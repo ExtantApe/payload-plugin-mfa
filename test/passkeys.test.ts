@@ -100,6 +100,7 @@ beforeAll(async () => {
     collections: [
       {
         slug: 'users',
+        trash: true,
         auth: { maxLoginAttempts: 5, lockTime: 600_000 },
         access: { read: () => true, update: () => true },
         fields: [{ name: 'role', type: 'text' }],
@@ -169,6 +170,14 @@ describe('setup', () => {
     expect(build({ rpID: RP, origins: ['https://notexample.test'] })).toThrow(/outside/)
     expect(build({ rpID: 'localhost', origins: ['http://localhost:3000'] })).not.toThrow()
     expect(build({ rpID: RP, origins: [ORIGIN], maxPerAccount: 0 })).toThrow(/maxPerAccount/)
+  })
+  it('refuses to start when a limit could switch the limiter off', () => {
+    const limits = (l: unknown) => () => mfa({ limits: l as never })(base as never)
+    expect(limits({ code: 5, emailCode: 3, passkey: 10, windowMinutes: 15 })).not.toThrow()
+    expect(limits({ code: 1, emailCode: 1, passkey: 1, windowMinutes: 1 })).not.toThrow()
+    for (const key of ['code', 'emailCode', 'passkey', 'windowMinutes'])
+      for (const bad of [0, -1, 0.5, 1.5, Number.NaN, Infinity, -Infinity, '5'])
+        expect(limits({ [key]: bad }), `${key}=${String(bad)}`).toThrow(new RegExp(key))
   })
   it('adds no passkey collections when passkeys are off, and refuses every call', async () => {
     const out = mfa()(base as never) as { collections: { slug: string }[] }
@@ -390,6 +399,50 @@ describe('signing in with a passkey', () => {
     const h = await addPasskey(hidden)
     expect(await reasonOf(viaPasskey(h.device))).toBe('wrongPasskey')
     expect(await sessionsOf(hidden)).toBe(0)
+  })
+
+  it('refuses a soft-deleted (trashed) account, and signs it in again once it is restored', async () => {
+    const u = await make()
+    const { device } = await addPasskey(u)
+    await payload.db.updateOne({ collection: 'users', where: { id: { equals: u.id } } as never, data: { deletedAt: new Date().toISOString() }, returning: false })
+    expect(await reasonOf(viaPasskey(device))).toBe('wrongPasskey')
+    const trashed = (await payload.findByID({ collection: 'users', id: u.id, trash: true, overrideAccess: true, showHiddenFields: true, depth: 0 })) as unknown as { sessions?: unknown[] }
+    expect(trashed.sessions?.length ?? 0).toBe(0)
+    await payload.db.updateOne({ collection: 'users', where: { id: { equals: u.id } } as never, data: { deletedAt: null }, returning: false })
+    expect(await reasonOf(viaPasskey(device))).toBe('ok')
+  })
+
+  it('lets only one of two answers at the same counter through, however they interleave', async () => {
+    const u = await make()
+    const { device } = await addPasskey(u)
+    // Two fresh checks (a passkey proof, which needs no session) answered at the same counter.
+    const one = await passkeyProofOptions(payload, { userId: u.id })
+    const two = await passkeyProofOptions(payload, { userId: u.id })
+    const a = device.get(one.options as never, ORIGIN, { counter: 1 })
+    const b = device.get(two.options as never, ORIGIN, { counter: 1 })
+    // Hold both answers just before they move the counter, so each has been checked against the same stored count.
+    const db = payload.db as unknown as { updateOne: (args: { collection: string }) => Promise<unknown> }
+    const real = db.updateOne
+    let waiting = 0
+    let release: () => void = () => undefined
+    const both = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    db.updateOne = function (this: unknown, args: { collection: string }) {
+      if (args.collection !== 'mfa-passkeys') return real.call(this, args)
+      waiting++
+      if (waiting >= 2) release()
+      return Promise.race([both, new Promise((r) => setTimeout(r, 5000))]).then(() => real.call(this, args))
+    }
+    let results: string[]
+    try {
+      results = await Promise.all([reasonOf(beginPasskey(payload, { userId: u.id, proof: { passkey: { token: one.token, response: a } } })), reasonOf(beginPasskey(payload, { userId: u.id, proof: { passkey: { token: two.token, response: b } } }))])
+    } finally {
+      db.updateOne = real
+    }
+    expect(waiting).toBe(2)
+    expect(results.filter((r) => r === 'ok')).toHaveLength(1)
+    expect(results.filter((r) => r === 'wrongPasskey')).toHaveLength(1)
   })
 
   it('refuses a locked account', async () => {
@@ -647,6 +700,26 @@ describe('limits', () => {
     expect(events.some((e) => e.type === 'passkey-refused' && e.detail?.why === 'address-limit')).toBe(true)
     // An address that is known has its own bucket and still works.
     expect(await reasonOf(passkeySignInOptions(payload))).toBe('ok')
+  })
+
+  it('uses one try from the shared bucket for a good sign-in with no address, not two', async () => {
+    const o = optionsOf(payload) as { limit?: (a: { kind: string; key: string }) => boolean }
+    const u = await make()
+    const { device } = await addPasskey(u)
+    const seen: string[] = []
+    try {
+      o.limit = ({ kind, key }) => {
+        seen.push(`${kind}|${key}`)
+        return true
+      }
+      const { token, options } = await signInOptionsRaw(payload)
+      seen.length = 0
+      await signInRaw(payload, { token, response: device.get(options as never, ORIGIN) })
+    } finally {
+      delete o.limit
+    }
+    expect(seen.filter((k) => k.endsWith('address:unknown'))).toEqual(['passkey-address|address:unknown'])
+    expect(seen.filter((k) => k.includes('account:'))).toHaveLength(1)
   })
 
   it('hands a site’s own limiter the shared key when no address is known', async () => {

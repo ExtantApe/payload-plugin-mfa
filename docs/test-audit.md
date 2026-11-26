@@ -1,5 +1,12 @@
 # Test audit
 
+## 2026-11-26: passkeys, after the first two reviews
+
+- Promises added since the last entry: passkey sign-in runs Payload's login steps (operation hooks, read pipeline, failed-attempt reset) and any hook can refuse; trashed accounts can't sign in; with no known address, passkey tries share one limited bucket and a sign-in uses one try; limits must be whole numbers of at least 1; challenge purpose and owner are enforced; two answers at one counter can't both pass.
+- Covered, in `test/passkeys.test.ts` (97 tests in the suite): the login-steps test, the trashed-account test, the shared-bucket tests (built-in and site limiter, one try per sign-in), the start-up refusal test (0, -1, 0.5, 1.5, NaN, Infinity, -Infinity and a string for every limit), the purpose and owner tests, and the counter test, which holds two fresh checks at the same point before the counter moves. Each was run without its protection and failed: trash filter, limit validation, one try per sign-in, purpose check, owner check, counter guard.
+- Gaps skipped (and why): a sign-in race at one counter is also stopped by the database's write conflict on the account, so only the fresh-check path isolates the counter guard; Payload versions before 3.90 are refused by the peer range, not tested. Real browsers and devices stay for a manual run on a site.
+- Still open from the review: checking `Origin` or content type on the endpoints, config validation for `challengeMinutes` and origins, ending the session when `onEvent` throws.
+
 ## 2026-11-25: passkeys
 
 - Promises (ADR 0002 and the README section): discoverable, user-verified passkeys; sign-in alone starts a normal Payload session; several named passkeys; a fresh check to add and remove; single-use challenges tied to purpose and account; limits per account and address; one refusal for every sign-in problem; recovery codes and the app still work; reset removes passkeys; events carry no secrets; hidden collections; off unless configured.
