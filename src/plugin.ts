@@ -1,6 +1,7 @@
 import { AuthenticationError, Forbidden, generatePayloadCookie, type AuthStrategy, type CollectionAfterOperationHook, type CollectionBeforeLoginHook, type CollectionBeforeOperationHook, type CollectionConfig, type Config, type Endpoint, type Payload, type Plugin } from 'payload'
 
 import { afterPasswordSet, rememberValue } from './api.js'
+import { hasPasskeys, passkeySignIn, passkeySignInOptions } from './passkeys.js'
 import {
   acceptCode,
   allowed,
@@ -8,9 +9,11 @@ import {
   inEnrollWindow,
   isOnState,
   isRequired,
+  hasUnmovedState,
   keysOf,
   loadState,
   optionsOf,
+  rawUsers,
   REMEMBER_COOKIE,
   rememberedSince,
   saveIfUnchanged,
@@ -22,6 +25,7 @@ import {
   MFA_TRUSTED,
   withSession,
 } from './core.js'
+import { MfaRefused } from './core.js'
 import type { Resolved, MfaOptions, MfaState, MfaUser } from './types.js'
 
 /** Same answer as a wrong password to anyone reading the API; the site's own form reads `mfa`. */
@@ -70,6 +74,43 @@ function attemptsCollection(o: Resolved): CollectionConfig {
     fields: [
       { name: 'keyHash', type: 'text', required: true, index: true },
       { name: 'at', type: 'date', required: true, index: true },
+    ],
+  }
+}
+
+/** One document per passkey. Written only by this plugin. The public key isn't secret, but it stays out of reach anyway. */
+function passkeyCollection(o: Resolved): CollectionConfig {
+  return {
+    slug: o.passkeyStore,
+    admin: { hidden: true },
+    access: { read: never, create: never, update: never, delete: never },
+    fields: [
+      { name: 'user', type: 'text', required: true, index: true },
+      { name: 'credentialId', type: 'text', required: true, unique: true, index: true },
+      { name: 'publicKey', type: 'text', required: true },
+      { name: 'counter', type: 'number' },
+      { name: 'transports', type: 'json' },
+      { name: 'name', type: 'text', required: true },
+      { name: 'deviceType', type: 'text' },
+      { name: 'backedUp', type: 'checkbox' },
+      { name: 'addedAt', type: 'date', index: true },
+      { name: 'lastUsedAt', type: 'date' },
+    ],
+  }
+}
+
+/** Challenges for passkeys: random, used once, short-lived. */
+function challengeCollection(o: Resolved): CollectionConfig {
+  return {
+    slug: o.challenges,
+    admin: { hidden: true },
+    access: { read: never, create: never, update: never, delete: never },
+    fields: [
+      { name: 'tokenHash', type: 'text', required: true, unique: true, index: true },
+      { name: 'kind', type: 'text', required: true },
+      { name: 'user', type: 'text' },
+      { name: 'challenge', type: 'text', required: true },
+      { name: 'expiresAt', type: 'date', required: true, index: true },
     ],
   }
 }
@@ -125,13 +166,14 @@ const beforeOperation: CollectionBeforeOperationHook = async ({ operation, req }
   const user = req.user as unknown as MfaUser
   const { state } = await loadState(payload, user.id, req)
   if (sessionBeforeReset(state, user)) throw new Forbidden(req.t)
-  if (!isOnState(state)) {
-    if ((await isRequired(payload, user, req)) && !inEnrollWindow(state)) throw new Forbidden(req.t)
-    return
-  }
   const verified = sessionVerifiedAt(state, user._sid)
   const tokenMs = (payload.collections[o.users as never]?.config.auth as { tokenExpiration?: number } | undefined)?.tokenExpiration ?? 7200
-  if (verified === null || Date.now() - verified > o.rememberHours * HOUR - tokenMs * 1000) throw new Forbidden(req.t)
+  const fresh = verified !== null && Date.now() - verified <= o.rememberHours * HOUR - tokenMs * 1000
+  if (!isOnState(state)) {
+    if ((await isRequired(payload, user, req)) && !inEnrollWindow(state) && !(fresh && (await hasPasskeys(payload, user.id, req)))) throw new Forbidden(req.t)
+    return
+  }
+  if (!fresh) throw new Forbidden(req.t)
 }
 
 /** A password reset by email: the mailbox just proved itself, so it can't be the second step for a while. */
@@ -155,29 +197,15 @@ function wrapStrategies(payload: Payload, o: Resolved) {
         const { state } = await loadState(payload, user.id)
         if (sessionBeforeReset(state, user)) return { ...result, user: null }
         if (!o.requiredFor) return result
-        if (!isOnState(state) && (await isRequired(payload, user)) && !inEnrollWindow(state)) return { ...result, user: null }
+        if (!isOnState(state) && (await isRequired(payload, user)) && !inEnrollWindow(state)) {
+          // A session a passkey started counts as the second step, for as long as the account still has a passkey.
+          const passkeySession = sessionVerifiedAt(state, user._sid) !== null && (await hasPasskeys(payload, user.id))
+          if (!passkeySession) return { ...result, user: null }
+        }
         return result
       },
     }),
   )
-}
-
-type RawUsers = {
-  base?: { Types?: { ObjectId?: new (s: string) => unknown } }
-  collection: { find: (q: object, opts?: object) => { toArray: () => Promise<Record<string, unknown>[]> }; updateOne: (q: object, u: object) => Promise<unknown>; countDocuments: (q: object) => Promise<number> }
-}
-const rawUsers = (payload: Payload, o: Resolved): RawUsers => {
-  const users = (payload.db as unknown as { collections?: Record<string, RawUsers> }).collections?.[o.users]
-  if (!users) throw new Error('mfa: `legacyUserField` needs the MongoDB adapter.')
-  return users
-}
-
-/** While an account still has state in the old field, it can't sign in: it can't run half-moved and weaker. */
-async function hasUnmovedState(payload: Payload, o: Resolved, userId: string | number) {
-  const users = rawUsers(payload, o)
-  const ObjectId = users.base?.Types?.ObjectId
-  const id = ObjectId && /^[a-f0-9]{24}$/i.test(String(userId)) ? new ObjectId(String(userId)) : userId
-  return (await users.collection.countDocuments({ _id: id, [o.legacyUserField!]: { $exists: true, $ne: null } })) > 0
 }
 
 const isEmpty = (v: unknown) => v === null || v === undefined || v === '' || (Array.isArray(v) && v.length === 0) || (typeof v === 'object' && !Array.isArray(v) && Object.keys(v as object).length === 0)
@@ -282,6 +310,43 @@ function loginEndpoint(o: Resolved): Endpoint {
   }
 }
 
+/** Passkey sign-in over HTTP, for sites without server actions. Every refusal is the same 401. */
+function passkeyEndpoints(o: Resolved): Endpoint[] {
+  const refused = () => Response.json({ ok: false, errors: [{ message: 'That passkey didn’t work.' }] }, { status: 401, headers: { 'Cache-Control': 'no-store' } })
+  return [
+    {
+      path: '/mfa/passkey/options',
+      method: 'post',
+      handler: async (req) => {
+        try {
+          const { token, options } = await passkeySignInOptions(req.payload, { req })
+          return Response.json({ ok: true, token, options }, { headers: { 'Cache-Control': 'no-store' } })
+        } catch (error) {
+          if (error instanceof MfaRefused && error.reason === 'tooMany') return Response.json({ ok: false, errors: [{ message: error.message }] }, { status: 429, headers: { 'Cache-Control': 'no-store' } })
+          return refused()
+        }
+      },
+    },
+    {
+      path: '/mfa/passkey/sign-in',
+      method: 'post',
+      handler: async (req) => {
+        const payload = req.payload
+        const body = ((await req.json?.().catch(() => null)) ?? {}) as { token?: unknown; response?: unknown }
+        try {
+          const result = await passkeySignIn(payload, { token: body.token, response: body.response, req })
+          const auth = payload.collections[o.users as never]!.config.auth
+          const headers = new Headers({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+          headers.append('Set-Cookie', generatePayloadCookie({ collectionAuthConfig: auth, cookiePrefix: payload.config.cookiePrefix, token: result.token }) as string)
+          return new Response(JSON.stringify({ ok: true, user: { id: result.user.id } }), { status: 200, headers })
+        } catch {
+          return refused()
+        }
+      },
+    },
+  ]
+}
+
 /**
  * Two-step sign-in for Payload: an authenticator code after the password, with emailed and recovery codes as
  * backups, each used once, limited per account, and required by the site's own rule.
@@ -303,15 +368,40 @@ export const mfa =
       onEvent: options.onEvent,
       legacyUserField: options.legacyUserField,
       keyDerivation: { salt: options.keyDerivation?.salt ?? 'payload-plugin-mfa', info: options.keyDerivation?.info ?? 'two-step-secret' },
-      limits: { code: options.limits?.code ?? 5, emailCode: options.limits?.emailCode ?? 3, windowMinutes: options.limits?.windowMinutes ?? 15 },
+      limits: { code: options.limits?.code ?? 5, emailCode: options.limits?.emailCode ?? 3, passkey: options.limits?.passkey ?? 10, windowMinutes: options.limits?.windowMinutes ?? 15 },
+      passkeyStore: 'mfa-passkeys',
+      challenges: 'mfa-challenges',
+      passkeyConfig: options.passkeys
+        ? { rpID: options.passkeys.rpID, rpName: options.passkeys.rpName ?? options.issuer ?? 'Payload', origins: options.passkeys.origins, maxPerAccount: options.passkeys.maxPerAccount ?? 10, challengeMinutes: options.passkeys.challengeMinutes ?? 5 }
+        : null,
       attempts: 'mfa-attempts',
       stateSlug: 'mfa-state',
     }
+    for (const [name, value] of Object.entries(o.limits)) if (!Number.isInteger(value) || value < 1) throw new Error(`mfa: limits.${name} must be a whole number of at least 1 (anything lower switches the limiter off).`)
     if (!config.secret || config.secret.length < 32) throw new Error('mfa: the app secret must be at least 32 characters (it seals the authenticator secrets).')
     const users = (config.collections ?? []).find((c) => c.slug === o.users)
     if (!users?.auth) throw new Error(`mfa: no auth collection "${o.users}".`)
     if (typeof users.auth === 'object' && users.auth.useAPIKey)
       throw new Error('mfa: API keys sign in without a password or code, which would skip two-step. Turn off `auth.useAPIKey` on this collection, or put API keys on a separate collection.')
+    if (o.passkeyConfig) {
+      const p = o.passkeyConfig
+      if (!p.rpID || /[/:\s]/.test(p.rpID)) throw new Error('mfa: passkeys `rpID` must be a bare domain such as example.com.')
+      if (!p.origins.length) throw new Error('mfa: passkeys need at least one `origins` entry, such as https://example.com.')
+      for (const origin of p.origins) {
+        let url: URL
+        try {
+          url = new URL(origin)
+        } catch {
+          throw new Error(`mfa: passkey origin "${origin}" isn't a URL.`)
+        }
+        const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1'
+        if (url.origin !== origin) throw new Error(`mfa: passkey origin "${origin}" must be written as ${url.origin}, with no path or trailing slash.`)
+        if (url.protocol !== 'https:' && !(local && url.protocol === 'http:')) throw new Error(`mfa: passkey origin "${origin}" must be https (http only for localhost).`)
+        if (url.hostname !== p.rpID && !url.hostname.endsWith(`.${p.rpID}`)) throw new Error(`mfa: passkey origin "${origin}" is outside the rpID "${p.rpID}".`)
+      }
+      if (!(p.maxPerAccount >= 1 && p.maxPerAccount <= 100)) throw new Error('mfa: passkeys `maxPerAccount` must be 1 to 100.')
+      for (const slug of [o.passkeyStore, o.challenges]) if ((config.collections ?? []).some((c) => c.slug === slug)) throw new Error(`mfa: a collection "${slug}" already exists.`)
+    }
     for (const slug of [o.attempts, o.stateSlug]) if ((config.collections ?? []).some((c) => c.slug === slug)) throw new Error(`mfa: a collection "${slug}" already exists.`)
     if (o.rememberHours * 3600 <= ((typeof users.auth === 'object' && users.auth.tokenExpiration) || 7200))
       throw new Error('mfa: `rememberHours` must be longer than the collection’s `auth.tokenExpiration`.')
@@ -333,11 +423,12 @@ export const mfa =
                   beforeOperation: [...(c.hooks?.beforeOperation ?? []), beforeOperation],
                   afterOperation: [...(c.hooks?.afterOperation ?? []), afterOperation],
                 },
-                endpoints: [...(c.endpoints || []), ...(o.endpoint ? [loginEndpoint(o)] : [])],
+                endpoints: [...(c.endpoints || []), ...(o.endpoint ? [loginEndpoint(o), ...(o.passkeyConfig ? passkeyEndpoints(o) : [])] : [])],
               },
         ),
         stateCollection(o),
         attemptsCollection(o),
+        ...(o.passkeyConfig ? [passkeyCollection(o), challengeCollection(o)] : []),
       ],
       custom: { ...config.custom, mfa: o },
       onInit: async (payload) => {

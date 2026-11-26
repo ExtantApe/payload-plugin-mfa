@@ -1,7 +1,7 @@
 {
   "name": "@extantape/payload-plugin-mfa",
   "version": "0.1.0",
-  "description": "MFA for Payload (two-step sign-in): an authenticator code after the password, with email and recovery codes as backups, each used once, rate limited per account, and required by a rule you set.",
+  "description": "MFA for Payload: sign in with a passkey, or with an authenticator code after the password. Emailed and recovery codes are backups, each used once, rate limited per account, and required by a rule you set.",
   "keywords": [
     "payload",
     "payload-plugin",
@@ -13,7 +13,10 @@
     "two-factor",
     "two-step",
     "totp",
-    "recovery-codes"
+    "recovery-codes",
+    "passkey",
+    "passkeys",
+    "webauthn"
   ],
   "license": "MIT",
   "homepage": "https://github.com/ExtantApe/payload-plugin-mfa#readme",
@@ -49,10 +52,11 @@
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "dependencies": {
+    "@simplewebauthn/server": "14.1.0",
     "otpauth": "9.6.0"
   },
   "peerDependencies": {
-    "payload": "^3.80.0"
+    "payload": "^3.90.0"
   },
   "devDependencies": {
     "@payloadcms/db-mongodb": "3.92.1",
